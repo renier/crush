@@ -209,15 +209,18 @@ func (app *App) resolveSession(ctx context.Context, continueSessionID string, us
 }
 
 // RunNonInteractive runs the application in non-interactive mode with the
-// given prompt, printing to stdout.
-func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt, largeModel, smallModel string, hideSpinner bool, continueSessionID string, useLast bool) error {
+// given prompt, writing results to output. The output format is controlled
+// by opts.Format: text streams plain text, json emits a single JSON object
+// after completion, and stream-json emits newline-delimited JSON events in
+// real time.
+func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, opts NonInteractiveOptions) error {
 	slog.Info("Running in non-interactive mode")
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	if largeModel != "" || smallModel != "" {
-		if err := app.overrideModelsForNonInteractive(ctx, largeModel, smallModel); err != nil {
+	if opts.LargeModel != "" || opts.SmallModel != "" {
+		if err := app.overrideModelsForNonInteractive(ctx, opts.LargeModel, opts.SmallModel); err != nil {
 			return fmt.Errorf("failed to override models: %w", err)
 		}
 	}
@@ -237,12 +240,11 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 	stdinTTY = term.IsTerminal(os.Stdin.Fd())
 	progress = app.config.Config().Options.Progress == nil || *app.config.Config().Options.Progress
 
-	if !hideSpinner && stderrTTY {
-		t := styles.ThemeForProvider(app.config.Config().Models[config.SelectedModelTypeLarge].Provider)
+	// Spinners are only useful for text output on a TTY.
+	showSpinner := !opts.HideSpinner && stderrTTY && opts.Format == OutputFormatText
+	if showSpinner {
+		t := styles.CharmtonePantera()
 
-		// Detect background color to set the appropriate color for the
-		// spinner's 'Generating...' text. Without this, that text would be
-		// unreadable in light terminals.
 		hasDarkBG := true
 		if f, ok := output.(*os.File); ok && stdinTTY && stdoutTTY {
 			hasDarkBG = lipgloss.HasDarkBackground(os.Stdin, f)
@@ -260,38 +262,49 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 		spinner.Start()
 	}
 
-	// Helper function to stop spinner once.
 	stopSpinner := func() {
-		if !hideSpinner && spinner != nil {
+		if showSpinner && spinner != nil {
 			spinner.Stop()
 			spinner = nil
 		}
 	}
 
-	// Wait for MCP initialization to complete before reading MCP tools.
 	if err := mcp.WaitForInit(ctx); err != nil {
 		return fmt.Errorf("failed to wait for MCP initialization: %w", err)
 	}
 
-	// force update of agent models before running so mcp tools are loaded
 	app.AgentCoordinator.UpdateModels(ctx)
 
 	defer stopSpinner()
 
-	sess, err := app.resolveSession(ctx, continueSessionID, useLast)
+	sess, err := app.resolveSession(ctx, opts.ContinueSessionID, opts.UseLast)
 	if err != nil {
 		return fmt.Errorf("failed to create session for non-interactive mode: %w", err)
 	}
 
-	if continueSessionID != "" || useLast {
+	if opts.ContinueSessionID != "" || opts.UseLast {
 		slog.Info("Continuing session for non-interactive run", "session_id", sess.ID)
 	} else {
 		slog.Info("Created session for non-interactive run", "session_id", sess.ID)
 	}
 
-	// Automatically approve all permission requests for this non-interactive
-	// session.
 	app.Permissions.AutoApproveSession(sess.ID)
+
+	// Capture model metadata before the run begins.
+	modelInfo := app.modelInfo()
+
+	// Emit the init event for stream-json.
+	if opts.Format == OutputFormatStreamJSON {
+		if err := writeStreamEvent(output, StreamEvent{
+			Type:      "init",
+			SessionID: sess.ID,
+			Model:     &modelInfo,
+		}); err != nil {
+			return fmt.Errorf("failed to write stream init event: %w", err)
+		}
+	}
+
+	start := time.Now()
 
 	type response struct {
 		result *fantasy.AgentResult
@@ -310,72 +323,392 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 		done <- response{
 			result: result,
 		}
-	}(ctx, sess.ID, prompt)
+	}(ctx, sess.ID, opts.Prompt)
 
-	messageEvents := app.Messages.Subscribe(ctx)
+	// Use blocking subscriptions for the non-interactive path so
+	// that no events are silently dropped when the consumer is
+	// momentarily slow.
+	var messageEvents <-chan pubsub.Event[message.Message]
+	if bs, ok := app.Messages.(pubsub.BlockingSubscriber[message.Message]); ok {
+		messageEvents = bs.SubscribeBlocking(ctx)
+	} else {
+		messageEvents = app.Messages.Subscribe(ctx)
+	}
+	var sessionEvents <-chan pubsub.Event[session.Session]
+	if bs, ok := app.Sessions.(pubsub.BlockingSubscriber[session.Session]); ok {
+		sessionEvents = bs.SubscribeBlocking(ctx)
+	} else {
+		sessionEvents = app.Sessions.Subscribe(ctx)
+	}
+	childSessions := make(map[string]bool)
 	messageReadBytes := make(map[string]int)
-	var printed bool
+	var (
+		printed        bool
+		contentBuilder strings.Builder
+	)
+
+	// Per-message tracking for stream-json delta emission. Only
+	// allocated when the output format actually needs it.
+	var msgState map[string]*streamMessageState
+	var contentBuf *streamContentBuffer
+	if opts.Format == OutputFormatStreamJSON {
+		msgState = make(map[string]*streamMessageState)
+		contentBuf = newStreamContentBuffer(output, sess.ID)
+	}
+
+	getState := func(id string) *streamMessageState {
+		if s, ok := msgState[id]; ok {
+			return s
+		}
+		s := &streamMessageState{
+			toolCallsSeen:   make(map[string]bool),
+			toolResultsSeen: make(map[string]bool),
+		}
+		msgState[id] = s
+		return s
+	}
+
+	// streamContent returns the accumulated content for stream-json, or
+	// the contentBuilder for other formats.
+	streamContent := func() string {
+		if contentBuf != nil {
+			return contentBuf.Total()
+		}
+		return contentBuilder.String()
+	}
 
 	defer func() {
-		if progress && stderrTTY {
+		if progress && stderrTTY && opts.Format == OutputFormatText {
 			_, _ = fmt.Fprintf(os.Stderr, ansi.ResetProgressBar)
 		}
-
-		// Always print a newline at the end. If output is a TTY this will
-		// prevent the prompt from overwriting the last line of output.
-		_, _ = fmt.Fprintln(output)
+		if opts.Format == OutputFormatText {
+			_, _ = fmt.Fprintln(output)
+		}
 	}()
 
+	// processMessage handles a single message event, writing content
+	// to the appropriate output and emitting stream-json events.
+	processMessage := func(msg message.Message) error {
+		if len(msg.Parts) == 0 {
+			return nil
+		}
+
+		isChildSession := childSessions[msg.SessionID]
+		if msg.SessionID != sess.ID && !isChildSession {
+			return nil
+		}
+
+		if msg.Role == message.Assistant && !isChildSession {
+			stopSpinner()
+
+			content := msg.Content().String()
+			readBytes := messageReadBytes[msg.ID]
+
+			if len(content) < readBytes {
+				slog.Error("Non-interactive: message content is shorter than read bytes", "message_length", len(content), "read_bytes", readBytes)
+				return fmt.Errorf("message content is shorter than read bytes: %d < %d", len(content), readBytes)
+			}
+
+			part := content[readBytes:]
+			if readBytes == 0 {
+				part = strings.TrimLeft(part, " \t")
+			}
+			if printed || strings.TrimSpace(part) != "" {
+				printed = true
+
+				switch opts.Format {
+				case OutputFormatText:
+					fmt.Fprint(output, part)
+				case OutputFormatJSON:
+					contentBuilder.WriteString(part)
+				case OutputFormatStreamJSON:
+					if part != "" {
+						if err := contentBuf.Write(part); err != nil {
+							return fmt.Errorf("failed to buffer stream content: %w", err)
+						}
+					}
+				}
+			}
+			messageReadBytes[msg.ID] = len(content)
+		}
+
+		if opts.Format != OutputFormatStreamJSON {
+			return nil
+		}
+
+		if err := contentBuf.Flush(); err != nil {
+			return fmt.Errorf("failed to flush content buffer: %w", err)
+		}
+
+		if err := emitStreamEvents(output, msg.SessionID, &msg, getState(msg.ID)); err != nil {
+			return fmt.Errorf("failed to write stream event: %w", err)
+		}
+
+		return nil
+	}
+
 	for {
-		if progress && stderrTTY {
-			// HACK: Reinitialize the terminal progress bar on every iteration
-			// so it doesn't get hidden by the terminal due to inactivity.
+		if progress && stderrTTY && opts.Format == OutputFormatText {
 			_, _ = fmt.Fprintf(os.Stderr, ansi.SetIndeterminateProgressBar)
+		}
+
+		// Arm a flush timer when the content buffer has pending data.
+		var flushTimer <-chan time.Time
+		if contentBuf != nil {
+			flushTimer = contentBuf.Timer()
 		}
 
 		select {
 		case result := <-done:
 			stopSpinner()
+
+			// Drain any message and session events that are
+			// already buffered so we don't miss final updates
+			// (e.g. message_finish) that were published just
+			// before the agent returned.
+			drainDeadline := time.After(500 * time.Millisecond)
+		drain:
+			for {
+				select {
+				case sev := <-sessionEvents:
+					if sev.Payload.ParentSessionID == sess.ID {
+						childSessions[sev.Payload.ID] = true
+					}
+				case ev := <-messageEvents:
+					if err := processMessage(ev.Payload); err != nil {
+						slog.Error("Failed to process message during drain", "error", err)
+					}
+				case <-drainDeadline:
+					break drain
+				default:
+					break drain
+				}
+			}
+
+			if contentBuf != nil {
+				if err := contentBuf.Flush(); err != nil {
+					slog.Error("Failed to flush content buffer on completion", "error", err)
+				}
+			}
 			if result.err != nil {
 				if errors.Is(result.err, context.Canceled) || errors.Is(result.err, agent.ErrRequestCancelled) {
 					slog.Debug("Non-interactive: agent processing cancelled", "session_id", sess.ID)
-					return nil
+					return app.emitFinalOutput(output, opts, sess.ID, streamContent(), start, true, nil)
 				}
-				return fmt.Errorf("agent processing failed: %w", result.err)
+				return app.emitFinalOutput(output, opts, sess.ID, streamContent(), start, false, result.err)
 			}
-			return nil
+			return app.emitFinalOutput(output, opts, sess.ID, streamContent(), start, false, nil)
 
-		case event := <-messageEvents:
-			msg := event.Payload
-			if msg.SessionID == sess.ID && msg.Role == message.Assistant && len(msg.Parts) > 0 {
-				stopSpinner()
-
-				content := msg.Content().String()
-				readBytes := messageReadBytes[msg.ID]
-
-				if len(content) < readBytes {
-					slog.Error("Non-interactive: message content is shorter than read bytes", "message_length", len(content), "read_bytes", readBytes)
-					return fmt.Errorf("message content is shorter than read bytes: %d < %d", len(content), readBytes)
+		case <-flushTimer:
+			if contentBuf != nil {
+				if err := contentBuf.Flush(); err != nil {
+					return fmt.Errorf("failed to flush content buffer: %w", err)
 				}
+			}
 
-				part := content[readBytes:]
-				// Trim leading whitespace. Sometimes the LLM includes leading
-				// formatting and intentation, which we don't want here.
-				if readBytes == 0 {
-					part = strings.TrimLeft(part, " \t")
-				}
-				// Ignore initial whitespace-only messages.
-				if printed || strings.TrimSpace(part) != "" {
-					printed = true
-					fmt.Fprint(output, part)
-				}
-				messageReadBytes[msg.ID] = len(content)
+		case sev := <-sessionEvents:
+			if sev.Payload.ParentSessionID == sess.ID {
+				childSessions[sev.Payload.ID] = true
+			}
+
+		case ev := <-messageEvents:
+			if err := processMessage(ev.Payload); err != nil {
+				return err
 			}
 
 		case <-ctx.Done():
 			stopSpinner()
+			if contentBuf != nil {
+				_ = contentBuf.Flush()
+			}
 			return ctx.Err()
 		}
+	}
+}
+
+// emitStreamEvents inspects a message and emits any stream-json events that
+// have not been sent yet for this message. It uses state to track what has
+// already been emitted so incremental updates produce only deltas.
+func emitStreamEvents(w io.Writer, sessionID string, msg *message.Message, state *streamMessageState) error {
+	// Emit message_start once per message.
+	if !state.started {
+		state.started = true
+		if err := writeStreamEvent(w, StreamEvent{
+			Type:      "message_start",
+			SessionID: sessionID,
+			MessageID: msg.ID,
+			Role:      string(msg.Role),
+		}); err != nil {
+			return err
+		}
+	}
+
+	// Emit thinking deltas.
+	reasoning := msg.ReasoningContent()
+	if len(reasoning.Thinking) > state.thinkingBytes {
+		delta := reasoning.Thinking[state.thinkingBytes:]
+		state.thinkingBytes = len(reasoning.Thinking)
+		if err := writeStreamEvent(w, StreamEvent{
+			Type:      "thinking",
+			SessionID: sessionID,
+			Thinking:  delta,
+		}); err != nil {
+			return err
+		}
+	}
+
+	// Emit tool_call events. A tool call is emitted once when first
+	// seen and again when it transitions to finished.
+	for _, tc := range msg.ToolCalls() {
+		emittedFinished := state.toolCallsSeen[tc.ID]
+		if emittedFinished {
+			continue
+		}
+		state.toolCallsSeen[tc.ID] = tc.Finished
+		if err := writeStreamEvent(w, StreamEvent{
+			Type:      "tool_call",
+			SessionID: sessionID,
+			ToolCall: &StreamToolCall{
+				ID:       tc.ID,
+				Name:     tc.Name,
+				Input:    tc.Input,
+				Finished: tc.Finished,
+			},
+		}); err != nil {
+			return err
+		}
+	}
+
+	// Emit tool_result events.
+	for _, tr := range msg.ToolResults() {
+		if !state.toolResultsSeen[tr.ToolCallID] {
+			state.toolResultsSeen[tr.ToolCallID] = true
+			content := tr.Content
+			if len(content) > 4096 {
+				content = content[:4096] + "… (truncated)"
+			}
+			if err := writeStreamEvent(w, StreamEvent{
+				Type:      "tool_result",
+				SessionID: sessionID,
+				ToolResult: &StreamToolResult{
+					ToolCallID: tr.ToolCallID,
+					Name:       tr.Name,
+					Content:    content,
+					IsError:    tr.IsError,
+				},
+			}); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Emit message_finish when the message has a finish part.
+	if !state.finished {
+		if f := msg.FinishPart(); f != nil {
+			state.finished = true
+			if err := writeStreamEvent(w, StreamEvent{
+				Type:         "message_finish",
+				SessionID:    sessionID,
+				MessageID:    msg.ID,
+				FinishReason: string(f.Reason),
+			}); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// emitFinalOutput writes structured output for json/stream-json formats
+// after the agent run completes. For text format this is a no-op (text is
+// already streamed).
+func (app *App) emitFinalOutput(output io.Writer, opts NonInteractiveOptions, sessionID, content string, start time.Time, cancelled bool, runErr error) error {
+	if opts.Format == OutputFormatText {
+		if runErr != nil {
+			return fmt.Errorf("agent processing failed: %w", runErr)
+		}
+		return nil
+	}
+
+	// Use a detached context so we can still read the session even when
+	// the parent context has been cancelled (e.g. SIGINT).
+	fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer fetchCancel()
+
+	updatedSession, sessionErr := app.Sessions.Get(fetchCtx, sessionID)
+	if sessionErr != nil {
+		slog.Warn("Failed to fetch session for output metadata", "error", sessionErr)
+	}
+
+	modelInfo := app.modelInfo()
+	elapsed := durationMS(start)
+
+	status := "success"
+	isError := false
+	var errMsg string
+	if cancelled {
+		status = "cancelled"
+	} else if runErr != nil {
+		status = "error"
+		isError = true
+		errMsg = runErr.Error()
+	}
+
+	usage := RunResultUsage{}
+	if sessionErr == nil {
+		usage.InputTokens = updatedSession.PromptTokens
+		usage.OutputTokens = updatedSession.CompletionTokens
+		usage.CostEstimate = updatedSession.Cost
+	}
+
+	switch opts.Format {
+	case OutputFormatJSON:
+		result := RunResult{
+			SessionID: sessionID,
+			Model:     modelInfo,
+			Execution: RunResultExec{
+				DurationMS: elapsed,
+				IsError:    isError,
+				Status:     status,
+				Error:      errMsg,
+			},
+			Result: RunResultOutput{Content: content},
+			Usage:  usage,
+		}
+		if err := writeJSON(output, result, opts.Pretty); err != nil {
+			return fmt.Errorf("failed to write JSON output: %w", err)
+		}
+
+	case OutputFormatStreamJSON:
+		if err := writeStreamEvent(output, StreamEvent{
+			Type:       "result",
+			SessionID:  sessionID,
+			DurationMS: &elapsed,
+			IsError:    &isError,
+			Error:      errMsg,
+			Usage:      &usage,
+		}); err != nil {
+			return fmt.Errorf("failed to write stream result event: %w", err)
+		}
+	}
+
+	if runErr != nil {
+		return fmt.Errorf("agent processing failed: %w", runErr)
+	}
+	return nil
+}
+
+// modelInfo returns metadata about the currently selected large model.
+func (app *App) modelInfo() RunResultModel {
+	if app.AgentCoordinator == nil {
+		return RunResultModel{}
+	}
+	m := app.AgentCoordinator.Model()
+	return RunResultModel{
+		Name:          m.CatwalkCfg.Name,
+		Provider:      m.ModelCfg.Provider,
+		ContextWindow: m.CatwalkCfg.ContextWindow,
 	}
 }
 
