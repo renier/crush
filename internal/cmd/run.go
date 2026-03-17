@@ -11,6 +11,7 @@ import (
 
 	"charm.land/lipgloss/v2"
 	"charm.land/log/v2"
+	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/client"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/event"
@@ -61,17 +62,25 @@ crush run --continue "Follow up on your last response"
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		var (
-			quiet, _      = cmd.Flags().GetBool("quiet")
-			verbose, _    = cmd.Flags().GetBool("verbose")
-			largeModel, _ = cmd.Flags().GetString("model")
-			smallModel, _ = cmd.Flags().GetString("small-model")
-			sessionID, _  = cmd.Flags().GetString("session")
-			useLast, _    = cmd.Flags().GetBool("continue")
+			quiet, _        = cmd.Flags().GetBool("quiet")
+			verbose, _      = cmd.Flags().GetBool("verbose")
+			largeModel, _   = cmd.Flags().GetString("model")
+			smallModel, _   = cmd.Flags().GetString("small-model")
+			sessionID, _    = cmd.Flags().GetString("session")
+			useLast, _      = cmd.Flags().GetBool("continue")
+			outputFormat, _ = cmd.Flags().GetString("output-format")
+			pretty, _       = cmd.Flags().GetBool("pretty")
 		)
+
+		format := app.OutputFormat(outputFormat)
+		if !format.IsValid() {
+			return fmt.Errorf("invalid output format %q; valid formats: text, json, stream-json", outputFormat)
+		}
 
 		// Cancel on SIGINT or SIGTERM.
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
 		defer cancel()
+
 
 		prompt := strings.Join(args, " ")
 
@@ -92,6 +101,17 @@ crush run --continue "Follow up on your last response"
 			event.SetContinueBySessionID(true)
 		case useLast:
 			event.SetContinueLastSession(true)
+		}
+
+		opts := app.NonInteractiveOptions{
+			Prompt:            prompt,
+			LargeModel:        largeModel,
+			SmallModel:        smallModel,
+			HideSpinner:       quiet || verbose,
+			ContinueSessionID: sessionID,
+			UseLast:           useLast,
+			Format:            format,
+			Pretty:            pretty,
 		}
 
 		if useClientServer() {
@@ -119,7 +139,7 @@ crush run --continue "Follow up on your last response"
 				slog.SetDefault(slog.New(log.New(os.Stderr)))
 			}
 
-			return runNonInteractive(ctx, c, ws, prompt, largeModel, smallModel, quiet || verbose, sessionID, useLast)
+			return runNonInteractive(ctx, c, ws, opts)
 		}
 
 		ws, cleanup, err := setupLocalWorkspace(cmd)
@@ -139,7 +159,7 @@ crush run --continue "Follow up on your last response"
 		}
 
 		appWs := ws.(*workspace.AppWorkspace)
-		return appWs.App().RunNonInteractive(ctx, os.Stdout, prompt, largeModel, smallModel, quiet || verbose, sessionID, useLast)
+		return appWs.App().RunNonInteractive(ctx, os.Stdout, opts)
 	},
 }
 
@@ -150,6 +170,8 @@ func init() {
 	runCmd.Flags().String("small-model", "", "Small model to use. If not provided, uses the default small model for the provider")
 	runCmd.Flags().StringP("session", "s", "", "Continue a previous session by ID")
 	runCmd.Flags().BoolP("continue", "C", false, "Continue the most recent session")
+	runCmd.Flags().StringP("output-format", "o", "text", "Output format: text, json, stream-json")
+	runCmd.Flags().Bool("pretty", false, "Pretty-print JSON output")
 	runCmd.MarkFlagsMutuallyExclusive("session", "continue")
 }
 
@@ -159,18 +181,15 @@ func runNonInteractive(
 	ctx context.Context,
 	c *client.Client,
 	ws *proto.Workspace,
-	prompt, largeModel, smallModel string,
-	hideSpinner bool,
-	continueSessionID string,
-	useLast bool,
+	opts app.NonInteractiveOptions,
 ) error {
 	slog.Info("Running in non-interactive mode")
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	if largeModel != "" || smallModel != "" {
-		if err := overrideModels(ctx, c, ws, largeModel, smallModel); err != nil {
+	if opts.LargeModel != "" || opts.SmallModel != "" {
+		if err := overrideModels(ctx, c, ws, opts.LargeModel, opts.SmallModel); err != nil {
 			return fmt.Errorf("failed to override models: %w", err)
 		}
 	}
@@ -188,6 +207,7 @@ func runNonInteractive(
 	stdinTTY = term.IsTerminal(os.Stdin.Fd())
 	progress = ws.Config.Options.Progress == nil || *ws.Config.Options.Progress
 
+	hideSpinner := opts.HideSpinner
 	if !hideSpinner && stderrTTY {
 		t := styles.CharmtonePantera()
 
@@ -228,11 +248,11 @@ func runNonInteractive(
 
 	defer stopSpinner()
 
-	sess, err := resolveSession(ctx, c, ws.ID, continueSessionID, useLast)
+	sess, err := resolveSession(ctx, c, ws.ID, opts.ContinueSessionID, opts.UseLast)
 	if err != nil {
 		return fmt.Errorf("failed to resolve session: %w", err)
 	}
-	if continueSessionID != "" || useLast {
+	if opts.ContinueSessionID != "" || opts.UseLast {
 		slog.Info("Continuing session for non-interactive run", "session_id", sess.ID)
 	} else {
 		slog.Info("Created session for non-interactive run", "session_id", sess.ID)
@@ -243,7 +263,7 @@ func runNonInteractive(
 		return fmt.Errorf("failed to subscribe to events: %w", err)
 	}
 
-	if err := c.SendMessage(ctx, ws.ID, sess.ID, prompt); err != nil {
+	if err := c.SendMessage(ctx, ws.ID, sess.ID, opts.Prompt); err != nil {
 		return fmt.Errorf("failed to send message: %w", err)
 	}
 

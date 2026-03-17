@@ -204,15 +204,18 @@ func (app *App) resolveSession(ctx context.Context, continueSessionID string, us
 }
 
 // RunNonInteractive runs the application in non-interactive mode with the
-// given prompt, printing to stdout.
-func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt, largeModel, smallModel string, hideSpinner bool, continueSessionID string, useLast bool) error {
+// given prompt, writing results to output. The output format is controlled
+// by opts.Format: text streams plain text, json emits a single JSON object
+// after completion, and stream-json emits newline-delimited JSON events in
+// real time.
+func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, opts NonInteractiveOptions) error {
 	slog.Info("Running in non-interactive mode")
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	if largeModel != "" || smallModel != "" {
-		if err := app.overrideModelsForNonInteractive(ctx, largeModel, smallModel); err != nil {
+	if opts.LargeModel != "" || opts.SmallModel != "" {
+		if err := app.overrideModelsForNonInteractive(ctx, opts.LargeModel, opts.SmallModel); err != nil {
 			return fmt.Errorf("failed to override models: %w", err)
 		}
 	}
@@ -232,12 +235,11 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 	stdinTTY = term.IsTerminal(os.Stdin.Fd())
 	progress = app.config.Config().Options.Progress == nil || *app.config.Config().Options.Progress
 
-	if !hideSpinner && stderrTTY {
+	// Spinners are only useful for text output on a TTY.
+	showSpinner := !opts.HideSpinner && stderrTTY && opts.Format == OutputFormatText
+	if showSpinner {
 		t := styles.CharmtonePantera()
 
-		// Detect background color to set the appropriate color for the
-		// spinner's 'Generating...' text. Without this, that text would be
-		// unreadable in light terminals.
 		hasDarkBG := true
 		if f, ok := output.(*os.File); ok && stdinTTY && stdoutTTY {
 			hasDarkBG = lipgloss.HasDarkBackground(os.Stdin, f)
@@ -255,38 +257,49 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 		spinner.Start()
 	}
 
-	// Helper function to stop spinner once.
 	stopSpinner := func() {
-		if !hideSpinner && spinner != nil {
+		if showSpinner && spinner != nil {
 			spinner.Stop()
 			spinner = nil
 		}
 	}
 
-	// Wait for MCP initialization to complete before reading MCP tools.
 	if err := mcp.WaitForInit(ctx); err != nil {
 		return fmt.Errorf("failed to wait for MCP initialization: %w", err)
 	}
 
-	// force update of agent models before running so mcp tools are loaded
 	app.AgentCoordinator.UpdateModels(ctx)
 
 	defer stopSpinner()
 
-	sess, err := app.resolveSession(ctx, continueSessionID, useLast)
+	sess, err := app.resolveSession(ctx, opts.ContinueSessionID, opts.UseLast)
 	if err != nil {
 		return fmt.Errorf("failed to create session for non-interactive mode: %w", err)
 	}
 
-	if continueSessionID != "" || useLast {
+	if opts.ContinueSessionID != "" || opts.UseLast {
 		slog.Info("Continuing session for non-interactive run", "session_id", sess.ID)
 	} else {
 		slog.Info("Created session for non-interactive run", "session_id", sess.ID)
 	}
 
-	// Automatically approve all permission requests for this non-interactive
-	// session.
 	app.Permissions.AutoApproveSession(sess.ID)
+
+	// Capture model metadata before the run begins.
+	modelInfo := app.modelInfo()
+
+	// Emit the init event for stream-json.
+	if opts.Format == OutputFormatStreamJSON {
+		if err := writeStreamEvent(output, StreamEvent{
+			Type:      "init",
+			SessionID: sess.ID,
+			Model:     &modelInfo,
+		}); err != nil {
+			return fmt.Errorf("failed to write stream init event: %w", err)
+		}
+	}
+
+	start := time.Now()
 
 	type response struct {
 		result *fantasy.AgentResult
@@ -305,26 +318,26 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 		done <- response{
 			result: result,
 		}
-	}(ctx, sess.ID, prompt)
+	}(ctx, sess.ID, opts.Prompt)
 
 	messageEvents := app.Messages.Subscribe(ctx)
 	messageReadBytes := make(map[string]int)
-	var printed bool
+	var (
+		printed        bool
+		contentBuilder strings.Builder
+	)
 
 	defer func() {
-		if progress && stderrTTY {
+		if progress && stderrTTY && opts.Format == OutputFormatText {
 			_, _ = fmt.Fprintf(os.Stderr, ansi.ResetProgressBar)
 		}
-
-		// Always print a newline at the end. If output is a TTY this will
-		// prevent the prompt from overwriting the last line of output.
-		_, _ = fmt.Fprintln(output)
+		if opts.Format == OutputFormatText {
+			_, _ = fmt.Fprintln(output)
+		}
 	}()
 
 	for {
-		if progress && stderrTTY {
-			// HACK: Reinitialize the terminal progress bar on every iteration
-			// so it doesn't get hidden by the terminal due to inactivity.
+		if progress && stderrTTY && opts.Format == OutputFormatText {
 			_, _ = fmt.Fprintf(os.Stderr, ansi.SetIndeterminateProgressBar)
 		}
 
@@ -334,14 +347,14 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 			if result.err != nil {
 				if errors.Is(result.err, context.Canceled) || errors.Is(result.err, agent.ErrRequestCancelled) {
 					slog.Debug("Non-interactive: agent processing cancelled", "session_id", sess.ID)
-					return nil
+					return app.emitFinalOutput(output, opts, sess.ID, contentBuilder.String(), start, true, nil)
 				}
-				return fmt.Errorf("agent processing failed: %w", result.err)
+				return app.emitFinalOutput(output, opts, sess.ID, contentBuilder.String(), start, false, result.err)
 			}
-			return nil
+			return app.emitFinalOutput(output, opts, sess.ID, contentBuilder.String(), start, false, nil)
 
-		case event := <-messageEvents:
-			msg := event.Payload
+		case ev := <-messageEvents:
+			msg := ev.Payload
 			if msg.SessionID == sess.ID && msg.Role == message.Assistant && len(msg.Parts) > 0 {
 				stopSpinner()
 
@@ -354,15 +367,27 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 				}
 
 				part := content[readBytes:]
-				// Trim leading whitespace. Sometimes the LLM includes leading
-				// formatting and intentation, which we don't want here.
 				if readBytes == 0 {
 					part = strings.TrimLeft(part, " \t")
 				}
-				// Ignore initial whitespace-only messages.
 				if printed || strings.TrimSpace(part) != "" {
 					printed = true
-					fmt.Fprint(output, part)
+
+					switch opts.Format {
+					case OutputFormatText:
+						fmt.Fprint(output, part)
+					case OutputFormatJSON:
+						contentBuilder.WriteString(part)
+					case OutputFormatStreamJSON:
+						contentBuilder.WriteString(part)
+						if err := writeStreamEvent(output, StreamEvent{
+							Type:      "content",
+							SessionID: sess.ID,
+							Content:   part,
+						}); err != nil {
+							return fmt.Errorf("failed to write stream content event: %w", err)
+						}
+					}
 				}
 				messageReadBytes[msg.ID] = len(content)
 			}
@@ -371,6 +396,97 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 			stopSpinner()
 			return ctx.Err()
 		}
+	}
+}
+
+// emitFinalOutput writes structured output for json/stream-json formats
+// after the agent run completes. For text format this is a no-op (text is
+// already streamed).
+func (app *App) emitFinalOutput(output io.Writer, opts NonInteractiveOptions, sessionID, content string, start time.Time, cancelled bool, runErr error) error {
+	if opts.Format == OutputFormatText {
+		if runErr != nil {
+			return fmt.Errorf("agent processing failed: %w", runErr)
+		}
+		return nil
+	}
+
+	// Use a detached context so we can still read the session even when
+	// the parent context has been cancelled (e.g. SIGINT).
+	fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer fetchCancel()
+
+	updatedSession, sessionErr := app.Sessions.Get(fetchCtx, sessionID)
+	if sessionErr != nil {
+		slog.Warn("Failed to fetch session for output metadata", "error", sessionErr)
+	}
+
+	modelInfo := app.modelInfo()
+	elapsed := durationMS(start)
+
+	status := "success"
+	isError := false
+	var errMsg string
+	if cancelled {
+		status = "cancelled"
+	} else if runErr != nil {
+		status = "error"
+		isError = true
+		errMsg = runErr.Error()
+	}
+
+	usage := RunResultUsage{}
+	if sessionErr == nil {
+		usage.InputTokens = updatedSession.PromptTokens
+		usage.OutputTokens = updatedSession.CompletionTokens
+		usage.CostEstimate = updatedSession.Cost
+	}
+
+	switch opts.Format {
+	case OutputFormatJSON:
+		result := RunResult{
+			SessionID: sessionID,
+			Model:     modelInfo,
+			Execution: RunResultExec{
+				DurationMS: elapsed,
+				IsError:    isError,
+				Status:     status,
+				Error:      errMsg,
+			},
+			Result: RunResultOutput{Content: content},
+			Usage:  usage,
+		}
+		if err := writeJSON(output, result, opts.Pretty); err != nil {
+			return fmt.Errorf("failed to write JSON output: %w", err)
+		}
+
+	case OutputFormatStreamJSON:
+		if err := writeStreamEvent(output, StreamEvent{
+			Type:       "result",
+			SessionID:  sessionID,
+			DurationMS: &elapsed,
+			IsError:    &isError,
+			Usage:      &usage,
+		}); err != nil {
+			return fmt.Errorf("failed to write stream result event: %w", err)
+		}
+	}
+
+	if runErr != nil {
+		return fmt.Errorf("agent processing failed: %w", runErr)
+	}
+	return nil
+}
+
+// modelInfo returns metadata about the currently selected large model.
+func (app *App) modelInfo() RunResultModel {
+	if app.AgentCoordinator == nil {
+		return RunResultModel{}
+	}
+	m := app.AgentCoordinator.Model()
+	return RunResultModel{
+		Name:          m.CatwalkCfg.Name,
+		Provider:      m.ModelCfg.Provider,
+		ContextWindow: m.CatwalkCfg.ContextWindow,
 	}
 }
 
