@@ -252,6 +252,38 @@ func TestStreamEvent_ResultEvent(t *testing.T) {
 	require.Contains(t, raw, "usage")
 }
 
+func TestStreamEvent_ResultEventIncludesError(t *testing.T) {
+	t.Parallel()
+
+	ev := StreamEvent{
+		Type:      "result",
+		SessionID: "s-1",
+		Error:     "timeout",
+	}
+
+	data, err := json.Marshal(ev)
+	require.NoError(t, err)
+	require.Contains(t, string(data), `"error":"timeout"`)
+}
+
+func TestNewStreamContentEvent(t *testing.T) {
+	t.Parallel()
+
+	t.Run("empty chunk is ignored", func(t *testing.T) {
+		t.Parallel()
+		require.Nil(t, newStreamContentEvent("s-1", ""))
+	})
+
+	t.Run("non-empty chunk is emitted", func(t *testing.T) {
+		t.Parallel()
+		ev := newStreamContentEvent("s-1", "hello")
+		require.NotNil(t, ev)
+		require.Equal(t, "content", ev.Type)
+		require.Equal(t, "s-1", ev.SessionID)
+		require.Equal(t, "hello", ev.Content)
+	})
+}
+
 // ---------------------------------------------------------------------------
 // writeStreamEvent
 // ---------------------------------------------------------------------------

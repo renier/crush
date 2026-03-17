@@ -85,6 +85,7 @@ type StreamEvent struct {
 	// Fields present only on "result" events.
 	DurationMS *int64          `json:"duration_ms,omitempty"`
 	IsError    *bool           `json:"is_error,omitempty"`
+	Error      string          `json:"error,omitempty"`
 	Usage      *RunResultUsage `json:"usage,omitempty"`
 }
 
@@ -102,6 +103,18 @@ func writeJSON(w io.Writer, v any, pretty bool) error {
 // writeStreamEvent writes a single NDJSON line.
 func writeStreamEvent(w io.Writer, ev StreamEvent) error {
 	return writeJSON(w, ev, false)
+}
+
+// newStreamContentEvent returns a content event for a non-empty chunk.
+func newStreamContentEvent(sessionID, part string) *StreamEvent {
+	if part == "" {
+		return nil
+	}
+	return &StreamEvent{
+		Type:      "content",
+		SessionID: sessionID,
+		Content:   part,
+	}
 }
 
 // NonInteractiveOptions bundles options for RunNonInteractive.

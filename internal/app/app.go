@@ -379,13 +379,11 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, opts No
 					case OutputFormatJSON:
 						contentBuilder.WriteString(part)
 					case OutputFormatStreamJSON:
-						contentBuilder.WriteString(part)
-						if err := writeStreamEvent(output, StreamEvent{
-							Type:      "content",
-							SessionID: sess.ID,
-							Content:   part,
-						}); err != nil {
-							return fmt.Errorf("failed to write stream content event: %w", err)
+						if ev := newStreamContentEvent(sess.ID, part); ev != nil {
+							contentBuilder.WriteString(part)
+							if err := writeStreamEvent(output, *ev); err != nil {
+								return fmt.Errorf("failed to write stream content event: %w", err)
+							}
 						}
 					}
 				}
@@ -465,6 +463,7 @@ func (app *App) emitFinalOutput(output io.Writer, opts NonInteractiveOptions, se
 			SessionID:  sessionID,
 			DurationMS: &elapsed,
 			IsError:    &isError,
+			Error:      errMsg,
 			Usage:      &usage,
 		}); err != nil {
 			return fmt.Errorf("failed to write stream result event: %w", err)
