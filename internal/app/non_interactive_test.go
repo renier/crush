@@ -210,7 +210,7 @@ func newNonInteractiveTestApp(
 		config:             store,
 		agentNotifications: pubsub.NewBroker[notify.Notification](),
 		serviceEventsWG:    &sync.WaitGroup{},
-		events:             make(chan tea.Msg, 100),
+		events:             pubsub.NewBroker[tea.Msg](),
 	}
 	t.Cleanup(func() {
 		sessions.Broker.Shutdown()
