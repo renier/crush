@@ -72,6 +72,17 @@ type RunResultUsage struct {
 
 // StreamEvent is a single line of newline-delimited JSON emitted by
 // crush run --output-format stream-json.
+//
+// Event types:
+//   - "init"           — emitted once at the start with model metadata.
+//   - "content"        — assistant text content delta.
+//   - "thinking"       — model reasoning/chain-of-thought delta.
+//   - "tool_call"      — a tool invocation by the assistant.
+//   - "tool_result"    — the result returned by a tool.
+//   - "message_start"  — marks the beginning of a new assistant turn.
+//   - "message_finish" — marks the end of an assistant turn with the
+//     finish reason.
+//   - "result"         — emitted once at the end with usage/duration.
 type StreamEvent struct {
 	Type      string `json:"type"`
 	SessionID string `json:"session_id"`
@@ -82,11 +93,53 @@ type StreamEvent struct {
 	// Fields present only on "content" events.
 	Content string `json:"content,omitempty"`
 
+	// Fields present only on "thinking" events.
+	Thinking string `json:"thinking,omitempty"`
+
+	// Fields present only on "tool_call" events.
+	ToolCall *StreamToolCall `json:"tool_call,omitempty"`
+
+	// Fields present only on "tool_result" events.
+	ToolResult *StreamToolResult `json:"tool_result,omitempty"`
+
+	// Fields present only on "message_start" events.
+	MessageID string `json:"message_id,omitempty"`
+	Role      string `json:"role,omitempty"`
+
+	// Fields present only on "message_finish" events.
+	FinishReason string `json:"finish_reason,omitempty"`
+
 	// Fields present only on "result" events.
 	DurationMS *int64          `json:"duration_ms,omitempty"`
 	IsError    *bool           `json:"is_error,omitempty"`
 	Error      string          `json:"error,omitempty"`
 	Usage      *RunResultUsage `json:"usage,omitempty"`
+}
+
+// StreamToolCall describes a tool invocation in a stream event.
+type StreamToolCall struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Input    string `json:"input,omitempty"`
+	Finished bool   `json:"finished"`
+}
+
+// StreamToolResult describes the result of a tool invocation.
+type StreamToolResult struct {
+	ToolCallID string `json:"tool_call_id"`
+	Name       string `json:"name"`
+	Content    string `json:"content,omitempty"`
+	IsError    bool   `json:"is_error"`
+}
+
+// streamMessageState tracks what has already been emitted for a single
+// message so that incremental updates produce only deltas.
+type streamMessageState struct {
+	started         bool
+	thinkingBytes   int
+	toolCallsSeen   map[string]bool
+	toolResultsSeen map[string]bool
+	finished        bool
 }
 
 // writeJSON serialises v as JSON to w. When pretty is true the output is

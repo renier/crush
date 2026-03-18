@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/crush/internal/message"
 	"github.com/stretchr/testify/require"
 )
 
@@ -352,4 +353,539 @@ func TestNonInteractiveOptions_Defaults(t *testing.T) {
 	require.False(t, opts.Pretty)
 	require.False(t, opts.HideSpinner)
 	require.False(t, opts.UseLast)
+}
+
+// ---------------------------------------------------------------------------
+// StreamEvent — new event types serialisation
+// ---------------------------------------------------------------------------
+
+func TestStreamEvent_ThinkingEvent(t *testing.T) {
+	t.Parallel()
+
+	ev := StreamEvent{
+		Type:      "thinking",
+		SessionID: "s-1",
+		Thinking:  "Let me consider the options...",
+	}
+
+	data, err := json.Marshal(ev)
+	require.NoError(t, err)
+
+	raw := make(map[string]json.RawMessage)
+	require.NoError(t, json.Unmarshal(data, &raw))
+
+	require.Contains(t, raw, "thinking")
+	_, hasContent := raw["content"]
+	require.False(t, hasContent, "thinking event should omit empty content")
+	_, hasModel := raw["model"]
+	require.False(t, hasModel, "thinking event should omit nil model")
+}
+
+func TestStreamEvent_ToolCallEvent(t *testing.T) {
+	t.Parallel()
+
+	ev := StreamEvent{
+		Type:      "tool_call",
+		SessionID: "s-1",
+		ToolCall: &StreamToolCall{
+			ID:       "tc-1",
+			Name:     "grep",
+			Input:    `{"pattern":"foo","path":"src/"}`,
+			Finished: false,
+		},
+	}
+
+	data, err := json.Marshal(ev)
+	require.NoError(t, err)
+
+	var decoded StreamEvent
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	require.Equal(t, "tool_call", decoded.Type)
+	require.NotNil(t, decoded.ToolCall)
+	require.Equal(t, "tc-1", decoded.ToolCall.ID)
+	require.Equal(t, "grep", decoded.ToolCall.Name)
+	require.False(t, decoded.ToolCall.Finished)
+}
+
+func TestStreamEvent_ToolResultEvent(t *testing.T) {
+	t.Parallel()
+
+	ev := StreamEvent{
+		Type:      "tool_result",
+		SessionID: "s-1",
+		ToolResult: &StreamToolResult{
+			ToolCallID: "tc-1",
+			Name:       "grep",
+			Content:    "src/foo.go:42: func Foo() {",
+			IsError:    false,
+		},
+	}
+
+	data, err := json.Marshal(ev)
+	require.NoError(t, err)
+
+	var decoded StreamEvent
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	require.Equal(t, "tool_result", decoded.Type)
+	require.NotNil(t, decoded.ToolResult)
+	require.Equal(t, "tc-1", decoded.ToolResult.ToolCallID)
+	require.False(t, decoded.ToolResult.IsError)
+}
+
+func TestStreamEvent_ToolResultErrorEvent(t *testing.T) {
+	t.Parallel()
+
+	ev := StreamEvent{
+		Type:      "tool_result",
+		SessionID: "s-1",
+		ToolResult: &StreamToolResult{
+			ToolCallID: "tc-2",
+			Name:       "bash",
+			Content:    "exit status 1",
+			IsError:    true,
+		},
+	}
+
+	data, err := json.Marshal(ev)
+	require.NoError(t, err)
+
+	var decoded StreamEvent
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	require.True(t, decoded.ToolResult.IsError)
+}
+
+func TestStreamEvent_MessageStartEvent(t *testing.T) {
+	t.Parallel()
+
+	ev := StreamEvent{
+		Type:      "message_start",
+		SessionID: "s-1",
+		MessageID: "msg-1",
+		Role:      "assistant",
+	}
+
+	data, err := json.Marshal(ev)
+	require.NoError(t, err)
+
+	raw := make(map[string]json.RawMessage)
+	require.NoError(t, json.Unmarshal(data, &raw))
+
+	require.Contains(t, raw, "message_id")
+	require.Contains(t, raw, "role")
+}
+
+func TestStreamEvent_MessageFinishEvent(t *testing.T) {
+	t.Parallel()
+
+	ev := StreamEvent{
+		Type:         "message_finish",
+		SessionID:    "s-1",
+		MessageID:    "msg-1",
+		FinishReason: "end_turn",
+	}
+
+	data, err := json.Marshal(ev)
+	require.NoError(t, err)
+
+	var decoded StreamEvent
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	require.Equal(t, "message_finish", decoded.Type)
+	require.Equal(t, "end_turn", decoded.FinishReason)
+}
+
+func TestStreamEvent_OmitsEmptyOptionalFields(t *testing.T) {
+	t.Parallel()
+
+	ev := StreamEvent{
+		Type:      "content",
+		SessionID: "s-1",
+		Content:   "hello",
+	}
+
+	data, err := json.Marshal(ev)
+	require.NoError(t, err)
+
+	raw := make(map[string]json.RawMessage)
+	require.NoError(t, json.Unmarshal(data, &raw))
+
+	for _, key := range []string{"thinking", "tool_call", "tool_result", "message_id", "role", "finish_reason", "duration_ms", "is_error", "usage", "model"} {
+		_, present := raw[key]
+		require.False(t, present, "content event should omit empty %q", key)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// emitStreamEvents
+// ---------------------------------------------------------------------------
+
+func TestEmitStreamEvents_MessageStart(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	msg := &message.Message{
+		ID:   "msg-1",
+		Role: message.Assistant,
+		Parts: []message.ContentPart{
+			message.TextContent{Text: "hello"},
+		},
+	}
+	state := &streamMessageState{
+		toolCallsSeen:   make(map[string]bool),
+		toolResultsSeen: make(map[string]bool),
+	}
+
+	require.NoError(t, emitStreamEvents(&buf, "s-1", msg, state))
+
+	events := parseNDJSON(t, buf.String())
+	require.True(t, len(events) >= 1)
+	require.Equal(t, "message_start", events[0].Type)
+	require.Equal(t, "msg-1", events[0].MessageID)
+	require.Equal(t, "assistant", events[0].Role)
+	require.True(t, state.started)
+}
+
+func TestEmitStreamEvents_MessageStartOnlyOnce(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	msg := &message.Message{
+		ID:   "msg-1",
+		Role: message.Assistant,
+		Parts: []message.ContentPart{
+			message.TextContent{Text: "hello"},
+		},
+	}
+	state := &streamMessageState{
+		toolCallsSeen:   make(map[string]bool),
+		toolResultsSeen: make(map[string]bool),
+	}
+
+	require.NoError(t, emitStreamEvents(&buf, "s-1", msg, state))
+	buf.Reset()
+
+	msg.Parts = []message.ContentPart{
+		message.TextContent{Text: "hello world"},
+	}
+	require.NoError(t, emitStreamEvents(&buf, "s-1", msg, state))
+
+	events := parseNDJSON(t, buf.String())
+	for _, ev := range events {
+		require.NotEqual(t, "message_start", ev.Type, "message_start should not be emitted twice")
+	}
+}
+
+func TestEmitStreamEvents_ThinkingDelta(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	msg := &message.Message{
+		ID:   "msg-1",
+		Role: message.Assistant,
+		Parts: []message.ContentPart{
+			message.ReasoningContent{Thinking: "Step 1: "},
+		},
+	}
+	state := &streamMessageState{
+		toolCallsSeen:   make(map[string]bool),
+		toolResultsSeen: make(map[string]bool),
+	}
+
+	require.NoError(t, emitStreamEvents(&buf, "s-1", msg, state))
+
+	events := parseNDJSON(t, buf.String())
+	thinkingEvents := filterEvents(events, "thinking")
+	require.Len(t, thinkingEvents, 1)
+	require.Equal(t, "Step 1: ", thinkingEvents[0].Thinking)
+
+	buf.Reset()
+	msg.Parts = []message.ContentPart{
+		message.ReasoningContent{Thinking: "Step 1: Analyze the code"},
+	}
+	require.NoError(t, emitStreamEvents(&buf, "s-1", msg, state))
+
+	events = parseNDJSON(t, buf.String())
+	thinkingEvents = filterEvents(events, "thinking")
+	require.Len(t, thinkingEvents, 1)
+	require.Equal(t, "Analyze the code", thinkingEvents[0].Thinking)
+}
+
+func TestEmitStreamEvents_ToolCall(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	msg := &message.Message{
+		ID:   "msg-1",
+		Role: message.Assistant,
+		Parts: []message.ContentPart{
+			message.ToolCall{
+				ID:    "tc-1",
+				Name:  "view",
+				Input: `{"file_path":"src/main.go"}`,
+			},
+		},
+	}
+	state := &streamMessageState{
+		toolCallsSeen:   make(map[string]bool),
+		toolResultsSeen: make(map[string]bool),
+	}
+
+	require.NoError(t, emitStreamEvents(&buf, "s-1", msg, state))
+
+	events := parseNDJSON(t, buf.String())
+	tcEvents := filterEvents(events, "tool_call")
+	require.Len(t, tcEvents, 1)
+	require.NotNil(t, tcEvents[0].ToolCall)
+	require.Equal(t, "tc-1", tcEvents[0].ToolCall.ID)
+	require.Equal(t, "view", tcEvents[0].ToolCall.Name)
+	require.False(t, tcEvents[0].ToolCall.Finished)
+}
+
+func TestEmitStreamEvents_ToolCallFinished(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	msg := &message.Message{
+		ID:   "msg-1",
+		Role: message.Assistant,
+		Parts: []message.ContentPart{
+			message.ToolCall{
+				ID:       "tc-1",
+				Name:     "view",
+				Input:    `{"file_path":"src/main.go"}`,
+				Finished: false,
+			},
+		},
+	}
+	state := &streamMessageState{
+		toolCallsSeen:   make(map[string]bool),
+		toolResultsSeen: make(map[string]bool),
+	}
+
+	require.NoError(t, emitStreamEvents(&buf, "s-1", msg, state))
+	buf.Reset()
+
+	msg.Parts = []message.ContentPart{
+		message.ToolCall{
+			ID:       "tc-1",
+			Name:     "view",
+			Input:    `{"file_path":"src/main.go"}`,
+			Finished: true,
+		},
+	}
+	require.NoError(t, emitStreamEvents(&buf, "s-1", msg, state))
+
+	events := parseNDJSON(t, buf.String())
+	tcEvents := filterEvents(events, "tool_call")
+	require.Len(t, tcEvents, 1)
+	require.True(t, tcEvents[0].ToolCall.Finished)
+}
+
+func TestEmitStreamEvents_ToolResult(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	msg := &message.Message{
+		ID:   "msg-2",
+		Role: message.Tool,
+		Parts: []message.ContentPart{
+			message.ToolResult{
+				ToolCallID: "tc-1",
+				Name:       "view",
+				Content:    "package main\n\nfunc main() {}",
+			},
+		},
+	}
+	state := &streamMessageState{
+		toolCallsSeen:   make(map[string]bool),
+		toolResultsSeen: make(map[string]bool),
+	}
+
+	require.NoError(t, emitStreamEvents(&buf, "s-1", msg, state))
+
+	events := parseNDJSON(t, buf.String())
+	trEvents := filterEvents(events, "tool_result")
+	require.Len(t, trEvents, 1)
+	require.NotNil(t, trEvents[0].ToolResult)
+	require.Equal(t, "tc-1", trEvents[0].ToolResult.ToolCallID)
+	require.Equal(t, "view", trEvents[0].ToolResult.Name)
+	require.False(t, trEvents[0].ToolResult.IsError)
+}
+
+func TestEmitStreamEvents_ToolResultNotDuplicated(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	msg := &message.Message{
+		ID:   "msg-2",
+		Role: message.Tool,
+		Parts: []message.ContentPart{
+			message.ToolResult{
+				ToolCallID: "tc-1",
+				Name:       "view",
+				Content:    "file contents",
+			},
+		},
+	}
+	state := &streamMessageState{
+		toolCallsSeen:   make(map[string]bool),
+		toolResultsSeen: make(map[string]bool),
+	}
+
+	require.NoError(t, emitStreamEvents(&buf, "s-1", msg, state))
+	buf.Reset()
+	require.NoError(t, emitStreamEvents(&buf, "s-1", msg, state))
+
+	events := parseNDJSON(t, buf.String())
+	trEvents := filterEvents(events, "tool_result")
+	require.Empty(t, trEvents, "tool_result should not be emitted twice for the same tool call")
+}
+
+func TestEmitStreamEvents_ToolResultTruncated(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	longContent := strings.Repeat("x", 5000)
+	msg := &message.Message{
+		ID:   "msg-2",
+		Role: message.Tool,
+		Parts: []message.ContentPart{
+			message.ToolResult{
+				ToolCallID: "tc-1",
+				Name:       "bash",
+				Content:    longContent,
+			},
+		},
+	}
+	state := &streamMessageState{
+		toolCallsSeen:   make(map[string]bool),
+		toolResultsSeen: make(map[string]bool),
+	}
+
+	require.NoError(t, emitStreamEvents(&buf, "s-1", msg, state))
+
+	events := parseNDJSON(t, buf.String())
+	trEvents := filterEvents(events, "tool_result")
+	require.Len(t, trEvents, 1)
+	require.True(t, len(trEvents[0].ToolResult.Content) < len(longContent))
+	require.Contains(t, trEvents[0].ToolResult.Content, "… (truncated)")
+}
+
+func TestEmitStreamEvents_MessageFinish(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	msg := &message.Message{
+		ID:   "msg-1",
+		Role: message.Assistant,
+		Parts: []message.ContentPart{
+			message.TextContent{Text: "Done."},
+			message.Finish{Reason: message.FinishReasonEndTurn, Time: time.Now().Unix()},
+		},
+	}
+	state := &streamMessageState{
+		toolCallsSeen:   make(map[string]bool),
+		toolResultsSeen: make(map[string]bool),
+	}
+
+	require.NoError(t, emitStreamEvents(&buf, "s-1", msg, state))
+
+	events := parseNDJSON(t, buf.String())
+	finishEvents := filterEvents(events, "message_finish")
+	require.Len(t, finishEvents, 1)
+	require.Equal(t, "end_turn", finishEvents[0].FinishReason)
+	require.Equal(t, "msg-1", finishEvents[0].MessageID)
+}
+
+func TestEmitStreamEvents_MessageFinishOnlyOnce(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	msg := &message.Message{
+		ID:   "msg-1",
+		Role: message.Assistant,
+		Parts: []message.ContentPart{
+			message.Finish{Reason: message.FinishReasonEndTurn, Time: time.Now().Unix()},
+		},
+	}
+	state := &streamMessageState{
+		toolCallsSeen:   make(map[string]bool),
+		toolResultsSeen: make(map[string]bool),
+	}
+
+	require.NoError(t, emitStreamEvents(&buf, "s-1", msg, state))
+	buf.Reset()
+	require.NoError(t, emitStreamEvents(&buf, "s-1", msg, state))
+
+	events := parseNDJSON(t, buf.String())
+	finishEvents := filterEvents(events, "message_finish")
+	require.Empty(t, finishEvents, "message_finish should not be emitted twice")
+}
+
+func TestEmitStreamEvents_FullLifecycle(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	state := &streamMessageState{
+		toolCallsSeen:   make(map[string]bool),
+		toolResultsSeen: make(map[string]bool),
+	}
+
+	// Turn 1: assistant thinks, then calls a tool.
+	msg := &message.Message{
+		ID:   "msg-1",
+		Role: message.Assistant,
+		Parts: []message.ContentPart{
+			message.ReasoningContent{Thinking: "I need to search."},
+			message.ToolCall{
+				ID:       "tc-1",
+				Name:     "grep",
+				Input:    `{"pattern":"TODO"}`,
+				Finished: true,
+			},
+			message.Finish{Reason: message.FinishReasonToolUse, Time: time.Now().Unix()},
+		},
+	}
+	require.NoError(t, emitStreamEvents(&buf, "s-1", msg, state))
+
+	events := parseNDJSON(t, buf.String())
+
+	typeSequence := make([]string, len(events))
+	for i, ev := range events {
+		typeSequence[i] = ev.Type
+	}
+	require.Equal(t, []string{
+		"message_start",
+		"thinking",
+		"tool_call",
+		"message_finish",
+	}, typeSequence)
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+func parseNDJSON(t *testing.T, s string) []StreamEvent {
+	t.Helper()
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	if len(lines) == 1 && lines[0] == "" {
+		return nil
+	}
+	events := make([]StreamEvent, 0, len(lines))
+	for i, line := range lines {
+		var ev StreamEvent
+		require.NoError(t, json.Unmarshal([]byte(line), &ev), "line %d is not valid JSON: %s", i, line)
+		events = append(events, ev)
+	}
+	return events
+}
+
+func filterEvents(events []StreamEvent, eventType string) []StreamEvent {
+	var out []StreamEvent
+	for _, ev := range events {
+		if ev.Type == eventType {
+			out = append(out, ev)
+		}
+	}
+	return out
 }

@@ -327,6 +327,25 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, opts No
 		contentBuilder strings.Builder
 	)
 
+	// Per-message tracking for stream-json delta emission. Only
+	// allocated when the output format actually needs it.
+	var msgState map[string]*streamMessageState
+	if opts.Format == OutputFormatStreamJSON {
+		msgState = make(map[string]*streamMessageState)
+	}
+
+	getState := func(id string) *streamMessageState {
+		if s, ok := msgState[id]; ok {
+			return s
+		}
+		s := &streamMessageState{
+			toolCallsSeen:   make(map[string]bool),
+			toolResultsSeen: make(map[string]bool),
+		}
+		msgState[id] = s
+		return s
+	}
+
 	defer func() {
 		if progress && stderrTTY && opts.Format == OutputFormatText {
 			_, _ = fmt.Fprintf(os.Stderr, ansi.ResetProgressBar)
@@ -355,7 +374,13 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, opts No
 
 		case ev := <-messageEvents:
 			msg := ev.Payload
-			if msg.SessionID == sess.ID && msg.Role == message.Assistant && len(msg.Parts) > 0 {
+			if msg.SessionID != sess.ID || len(msg.Parts) == 0 {
+				continue
+			}
+
+			// For text and json formats, only process assistant text
+			// content as before.
+			if msg.Role == message.Assistant {
 				stopSpinner()
 
 				content := msg.Content().String()
@@ -390,11 +415,115 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, opts No
 				messageReadBytes[msg.ID] = len(content)
 			}
 
+			// Emit additional stream-json events for all message
+			// parts the text-only path above does not cover.
+			if opts.Format != OutputFormatStreamJSON {
+				continue
+			}
+
+			if err := emitStreamEvents(output, sess.ID, &msg, getState(msg.ID)); err != nil {
+				return fmt.Errorf("failed to write stream event: %w", err)
+			}
+
 		case <-ctx.Done():
 			stopSpinner()
 			return ctx.Err()
 		}
 	}
+}
+
+// emitStreamEvents inspects a message and emits any stream-json events that
+// have not been sent yet for this message. It uses state to track what has
+// already been emitted so incremental updates produce only deltas.
+func emitStreamEvents(w io.Writer, sessionID string, msg *message.Message, state *streamMessageState) error {
+	// Emit message_start once per message.
+	if !state.started {
+		state.started = true
+		if err := writeStreamEvent(w, StreamEvent{
+			Type:      "message_start",
+			SessionID: sessionID,
+			MessageID: msg.ID,
+			Role:      string(msg.Role),
+		}); err != nil {
+			return err
+		}
+	}
+
+	// Emit thinking deltas.
+	reasoning := msg.ReasoningContent()
+	if len(reasoning.Thinking) > state.thinkingBytes {
+		delta := reasoning.Thinking[state.thinkingBytes:]
+		state.thinkingBytes = len(reasoning.Thinking)
+		if err := writeStreamEvent(w, StreamEvent{
+			Type:      "thinking",
+			SessionID: sessionID,
+			Thinking:  delta,
+		}); err != nil {
+			return err
+		}
+	}
+
+	// Emit tool_call events. A tool call is emitted once when first
+	// seen and again when it transitions to finished.
+	for _, tc := range msg.ToolCalls() {
+		alreadySeen := state.toolCallsSeen[tc.ID]
+		if alreadySeen && !tc.Finished {
+			continue
+		}
+		state.toolCallsSeen[tc.ID] = true
+		if err := writeStreamEvent(w, StreamEvent{
+			Type:      "tool_call",
+			SessionID: sessionID,
+			ToolCall: &StreamToolCall{
+				ID:       tc.ID,
+				Name:     tc.Name,
+				Input:    tc.Input,
+				Finished: tc.Finished,
+			},
+		}); err != nil {
+			return err
+		}
+	}
+
+	// Emit tool_result events.
+	for _, tr := range msg.ToolResults() {
+		if !state.toolResultsSeen[tr.ToolCallID] {
+			state.toolResultsSeen[tr.ToolCallID] = true
+			content := tr.Content
+			if len(content) > 4096 {
+				content = content[:4096] + "… (truncated)"
+			}
+			if err := writeStreamEvent(w, StreamEvent{
+				Type:      "tool_result",
+				SessionID: sessionID,
+				ToolResult: &StreamToolResult{
+					ToolCallID: tr.ToolCallID,
+					Name:       tr.Name,
+					Content:    content,
+					IsError:    tr.IsError,
+				},
+			}); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Emit message_finish when the message has a finish part.
+	if !state.finished {
+		if f := msg.FinishPart(); f != nil {
+			state.finished = true
+			if err := writeStreamEvent(w, StreamEvent{
+				Type:         "message_finish",
+				SessionID:    sessionID,
+				MessageID:    msg.ID,
+				FinishReason: string(f.Reason),
+			}); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 // emitFinalOutput writes structured output for json/stream-json formats
