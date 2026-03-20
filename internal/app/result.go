@@ -288,18 +288,6 @@ func writeStreamEvent(w io.Writer, ev StreamEvent) error {
 	return writeJSON(w, ev, false)
 }
 
-// newStreamContentEvent returns a content event for a non-empty chunk.
-func newStreamContentEvent(sessionID, part string) *StreamEvent {
-	if part == "" {
-		return nil
-	}
-	return &StreamEvent{
-		Type:      "content",
-		SessionID: sessionID,
-		Content:   part,
-	}
-}
-
 // NonInteractiveOptions bundles options for RunNonInteractive.
 type NonInteractiveOptions struct {
 	Prompt            string
