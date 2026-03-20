@@ -321,6 +321,8 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, opts No
 	}(ctx, sess.ID, opts.Prompt)
 
 	messageEvents := app.Messages.Subscribe(ctx)
+	sessionEvents := app.Sessions.Subscribe(ctx)
+	childSessions := make(map[string]bool)
 	messageReadBytes := make(map[string]int)
 	var (
 		printed        bool
@@ -330,8 +332,10 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, opts No
 	// Per-message tracking for stream-json delta emission. Only
 	// allocated when the output format actually needs it.
 	var msgState map[string]*streamMessageState
+	var contentBuf *streamContentBuffer
 	if opts.Format == OutputFormatStreamJSON {
 		msgState = make(map[string]*streamMessageState)
+		contentBuf = newStreamContentBuffer(output, sess.ID)
 	}
 
 	getState := func(id string) *streamMessageState {
@@ -344,6 +348,15 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, opts No
 		}
 		msgState[id] = s
 		return s
+	}
+
+	// streamContent returns the accumulated content for stream-json, or
+	// the contentBuilder for other formats.
+	streamContent := func() string {
+		if contentBuf != nil {
+			return contentBuf.Total()
+		}
+		return contentBuilder.String()
 	}
 
 	defer func() {
@@ -360,27 +373,57 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, opts No
 			_, _ = fmt.Fprintf(os.Stderr, ansi.SetIndeterminateProgressBar)
 		}
 
+		// Arm a flush timer when the content buffer has pending data.
+		var flushTimer <-chan time.Time
+		if contentBuf != nil {
+			flushTimer = contentBuf.Timer()
+		}
+
 		select {
 		case result := <-done:
 			stopSpinner()
+			if contentBuf != nil {
+				if err := contentBuf.Flush(); err != nil {
+					slog.Error("Failed to flush content buffer on completion", "error", err)
+				}
+			}
 			if result.err != nil {
 				if errors.Is(result.err, context.Canceled) || errors.Is(result.err, agent.ErrRequestCancelled) {
 					slog.Debug("Non-interactive: agent processing cancelled", "session_id", sess.ID)
-					return app.emitFinalOutput(output, opts, sess.ID, contentBuilder.String(), start, true, nil)
+					return app.emitFinalOutput(output, opts, sess.ID, streamContent(), start, true, nil)
 				}
-				return app.emitFinalOutput(output, opts, sess.ID, contentBuilder.String(), start, false, result.err)
+				return app.emitFinalOutput(output, opts, sess.ID, streamContent(), start, false, result.err)
 			}
-			return app.emitFinalOutput(output, opts, sess.ID, contentBuilder.String(), start, false, nil)
+			return app.emitFinalOutput(output, opts, sess.ID, streamContent(), start, false, nil)
+
+		case <-flushTimer:
+			if contentBuf != nil {
+				if err := contentBuf.Flush(); err != nil {
+					return fmt.Errorf("failed to flush content buffer: %w", err)
+				}
+			}
+
+		case sev := <-sessionEvents:
+			if sev.Payload.ParentSessionID == sess.ID {
+				childSessions[sev.Payload.ID] = true
+			}
 
 		case ev := <-messageEvents:
 			msg := ev.Payload
-			if msg.SessionID != sess.ID || len(msg.Parts) == 0 {
+			if len(msg.Parts) == 0 {
+				continue
+			}
+
+			isChildSession := childSessions[msg.SessionID]
+			if msg.SessionID != sess.ID && !isChildSession {
 				continue
 			}
 
 			// For text and json formats, only process assistant text
-			// content as before.
-			if msg.Role == message.Assistant {
+			// content from the parent session. Child session output
+			// arrives as a tool_result on the parent and should not
+			// be mixed in directly.
+			if msg.Role == message.Assistant && !isChildSession {
 				stopSpinner()
 
 				content := msg.Content().String()
@@ -404,10 +447,9 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, opts No
 					case OutputFormatJSON:
 						contentBuilder.WriteString(part)
 					case OutputFormatStreamJSON:
-						if ev := newStreamContentEvent(sess.ID, part); ev != nil {
-							contentBuilder.WriteString(part)
-							if err := writeStreamEvent(output, *ev); err != nil {
-								return fmt.Errorf("failed to write stream content event: %w", err)
+						if part != "" {
+							if err := contentBuf.Write(part); err != nil {
+								return fmt.Errorf("failed to buffer stream content: %w", err)
 							}
 						}
 					}
@@ -421,12 +463,22 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, opts No
 				continue
 			}
 
-			if err := emitStreamEvents(output, sess.ID, &msg, getState(msg.ID)); err != nil {
+			// Flush any buffered content before structural events
+			// so that text always appears before tool_call,
+			// message_finish, etc. in the output stream.
+			if err := contentBuf.Flush(); err != nil {
+				return fmt.Errorf("failed to flush content buffer: %w", err)
+			}
+
+			if err := emitStreamEvents(output, msg.SessionID, &msg, getState(msg.ID)); err != nil {
 				return fmt.Errorf("failed to write stream event: %w", err)
 			}
 
 		case <-ctx.Done():
 			stopSpinner()
+			if contentBuf != nil {
+				_ = contentBuf.Flush()
+			}
 			return ctx.Err()
 		}
 	}
@@ -466,11 +518,11 @@ func emitStreamEvents(w io.Writer, sessionID string, msg *message.Message, state
 	// Emit tool_call events. A tool call is emitted once when first
 	// seen and again when it transitions to finished.
 	for _, tc := range msg.ToolCalls() {
-		alreadySeen := state.toolCallsSeen[tc.ID]
-		if alreadySeen && !tc.Finished {
+		emittedFinished := state.toolCallsSeen[tc.ID]
+		if emittedFinished {
 			continue
 		}
-		state.toolCallsSeen[tc.ID] = true
+		state.toolCallsSeen[tc.ID] = tc.Finished
 		if err := writeStreamEvent(w, StreamEvent{
 			Type:      "tool_call",
 			SessionID: sessionID,

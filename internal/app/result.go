@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/json"
 	"io"
+	"strings"
 	"time"
 )
 
@@ -142,6 +143,135 @@ type streamMessageState struct {
 	finished        bool
 }
 
+// streamContentFlushInterval is how long the buffer waits before flushing
+// content that has not yet reached a sentence boundary. 300ms balances
+// coherence (~10-25 tokens at typical LLM speeds) with responsiveness.
+const streamContentFlushInterval = 300 * time.Millisecond
+
+// streamContentBuffer accumulates content deltas and flushes them as
+// complete sentences (or after a short timeout) so that stream-json
+// consumers receive coherent text rather than per-token fragments.
+type streamContentBuffer struct {
+	w         io.Writer
+	sessionID string
+	buf       strings.Builder
+	lastFlush time.Time
+	total     strings.Builder
+	timer     *time.Timer
+}
+
+func newStreamContentBuffer(w io.Writer, sessionID string) *streamContentBuffer {
+	return &streamContentBuffer{
+		w:         w,
+		sessionID: sessionID,
+		lastFlush: time.Now(),
+	}
+}
+
+// Write adds a text delta to the buffer and flushes if the accumulated
+// content ends at a natural boundary or the time threshold has elapsed.
+func (b *streamContentBuffer) Write(delta string) error {
+	if delta == "" {
+		return nil
+	}
+	b.buf.WriteString(delta)
+
+	if b.shouldFlush() {
+		return b.Flush()
+	}
+	return nil
+}
+
+// shouldFlush reports whether the buffer should be flushed now.
+func (b *streamContentBuffer) shouldFlush() bool {
+	s := b.buf.String()
+	if s == "" {
+		return false
+	}
+
+	if time.Since(b.lastFlush) >= streamContentFlushInterval {
+		return true
+	}
+
+	// Flush on newlines — paragraphs and line breaks are natural
+	// reading boundaries.
+	if strings.HasSuffix(s, "\n") {
+		return true
+	}
+
+	// Flush on sentence-ending punctuation followed by a space or at
+	// the end of the buffer, covering ". ", "! ", "? " patterns that
+	// signal a complete sentence.
+	n := len(s)
+	if n >= 2 {
+		prev := s[n-2]
+		cur := s[n-1]
+		if (prev == '.' || prev == '!' || prev == '?') && cur == ' ' {
+			return true
+		}
+	}
+
+	return false
+}
+
+// Flush writes any buffered content as a stream event immediately.
+func (b *streamContentBuffer) Flush() error {
+	s := b.buf.String()
+	if s == "" {
+		return nil
+	}
+	b.buf.Reset()
+	b.lastFlush = time.Now()
+	b.stopTimer()
+	b.total.WriteString(s)
+	return writeStreamEvent(b.w, StreamEvent{
+		Type:      "content",
+		SessionID: b.sessionID,
+		Content:   s,
+	})
+}
+
+// Total returns all content written through the buffer.
+func (b *streamContentBuffer) Total() string {
+	return b.total.String() + b.buf.String()
+}
+
+// Timer returns a channel that fires when buffered content should be
+// flushed due to the time threshold. Returns nil when the buffer is
+// empty. The timer is reused across calls to avoid goroutine/channel
+// churn in the select loop.
+func (b *streamContentBuffer) Timer() <-chan time.Time {
+	if b.buf.Len() == 0 {
+		b.stopTimer()
+		return nil
+	}
+	remaining := streamContentFlushInterval - time.Since(b.lastFlush)
+	if remaining <= 0 {
+		b.stopTimer()
+		ch := make(chan time.Time, 1)
+		ch <- time.Now()
+		return ch
+	}
+	if b.timer == nil {
+		b.timer = time.NewTimer(remaining)
+	} else {
+		b.timer.Reset(remaining)
+	}
+	return b.timer.C
+}
+
+// stopTimer stops and drains the reusable timer if it is active.
+func (b *streamContentBuffer) stopTimer() {
+	if b.timer != nil {
+		if !b.timer.Stop() {
+			select {
+			case <-b.timer.C:
+			default:
+			}
+		}
+	}
+}
+
 // writeJSON serialises v as JSON to w. When pretty is true the output is
 // indented for human readability.
 func writeJSON(w io.Writer, v any, pretty bool) error {
@@ -156,18 +286,6 @@ func writeJSON(w io.Writer, v any, pretty bool) error {
 // writeStreamEvent writes a single NDJSON line.
 func writeStreamEvent(w io.Writer, ev StreamEvent) error {
 	return writeJSON(w, ev, false)
-}
-
-// newStreamContentEvent returns a content event for a non-empty chunk.
-func newStreamContentEvent(sessionID, part string) *StreamEvent {
-	if part == "" {
-		return nil
-	}
-	return &StreamEvent{
-		Type:      "content",
-		SessionID: sessionID,
-		Content:   part,
-	}
 }
 
 // NonInteractiveOptions bundles options for RunNonInteractive.

@@ -267,24 +267,6 @@ func TestStreamEvent_ResultEventIncludesError(t *testing.T) {
 	require.Contains(t, string(data), `"error":"timeout"`)
 }
 
-func TestNewStreamContentEvent(t *testing.T) {
-	t.Parallel()
-
-	t.Run("empty chunk is ignored", func(t *testing.T) {
-		t.Parallel()
-		require.Nil(t, newStreamContentEvent("s-1", ""))
-	})
-
-	t.Run("non-empty chunk is emitted", func(t *testing.T) {
-		t.Parallel()
-		ev := newStreamContentEvent("s-1", "hello")
-		require.NotNil(t, ev)
-		require.Equal(t, "content", ev.Type)
-		require.Equal(t, "s-1", ev.SessionID)
-		require.Equal(t, "hello", ev.Content)
-	})
-}
-
 // ---------------------------------------------------------------------------
 // writeStreamEvent
 // ---------------------------------------------------------------------------
@@ -680,6 +662,44 @@ func TestEmitStreamEvents_ToolCallFinished(t *testing.T) {
 	require.True(t, tcEvents[0].ToolCall.Finished)
 }
 
+func TestEmitStreamEvents_ToolCallNoDuplicateAfterFinished(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	state := &streamMessageState{
+		toolCallsSeen:   make(map[string]bool),
+		toolResultsSeen: make(map[string]bool),
+	}
+
+	// First: unfinished tool call.
+	msg := &message.Message{
+		ID:   "msg-1",
+		Role: message.Assistant,
+		Parts: []message.ContentPart{
+			message.ToolCall{ID: "tc-1", Name: "view", Finished: false},
+		},
+	}
+	require.NoError(t, emitStreamEvents(&buf, "s-1", msg, state))
+
+	// Second: finished tool call.
+	msg.Parts = []message.ContentPart{
+		message.ToolCall{ID: "tc-1", Name: "view", Input: `{}`, Finished: true},
+	}
+	require.NoError(t, emitStreamEvents(&buf, "s-1", msg, state))
+
+	// Third: same finished tool call + a finish part (subsequent update).
+	buf.Reset()
+	msg.Parts = []message.ContentPart{
+		message.ToolCall{ID: "tc-1", Name: "view", Input: `{}`, Finished: true},
+		message.Finish{Reason: message.FinishReasonToolUse, Time: time.Now().Unix()},
+	}
+	require.NoError(t, emitStreamEvents(&buf, "s-1", msg, state))
+
+	events := parseNDJSON(t, buf.String())
+	tcEvents := filterEvents(events, "tool_call")
+	require.Empty(t, tcEvents, "finished tool_call should not be re-emitted on subsequent updates")
+}
+
 func TestEmitStreamEvents_ToolResult(t *testing.T) {
 	t.Parallel()
 
@@ -888,4 +908,176 @@ func filterEvents(events []StreamEvent, eventType string) []StreamEvent {
 		}
 	}
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// streamContentBuffer
+// ---------------------------------------------------------------------------
+
+func TestStreamContentBuffer_FlushOnSentenceBoundary(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	cb := newStreamContentBuffer(&buf, "s-1")
+
+	// Feed tokens one at a time — nothing should flush until we hit
+	// a sentence boundary.
+	for _, tok := range []string{"I", "'m", " going", " to", " look", "."} {
+		require.NoError(t, cb.Write(tok))
+	}
+	require.Empty(t, buf.String(), "no flush before sentence boundary")
+
+	// The space after the period triggers the flush.
+	require.NoError(t, cb.Write(" "))
+
+	events := parseNDJSON(t, buf.String())
+	contentEvents := filterEvents(events, "content")
+	require.Len(t, contentEvents, 1)
+	require.Equal(t, "I'm going to look. ", contentEvents[0].Content)
+}
+
+func TestStreamContentBuffer_FlushOnNewline(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	cb := newStreamContentBuffer(&buf, "s-1")
+
+	require.NoError(t, cb.Write("First line"))
+	require.Empty(t, buf.String())
+
+	require.NoError(t, cb.Write("\n"))
+
+	events := parseNDJSON(t, buf.String())
+	contentEvents := filterEvents(events, "content")
+	require.Len(t, contentEvents, 1)
+	require.Equal(t, "First line\n", contentEvents[0].Content)
+}
+
+func TestStreamContentBuffer_FlushOnExclamation(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	cb := newStreamContentBuffer(&buf, "s-1")
+
+	require.NoError(t, cb.Write("Done! "))
+
+	events := parseNDJSON(t, buf.String())
+	contentEvents := filterEvents(events, "content")
+	require.Len(t, contentEvents, 1)
+	require.Equal(t, "Done! ", contentEvents[0].Content)
+}
+
+func TestStreamContentBuffer_FlushOnQuestion(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	cb := newStreamContentBuffer(&buf, "s-1")
+
+	require.NoError(t, cb.Write("Ready? "))
+
+	events := parseNDJSON(t, buf.String())
+	contentEvents := filterEvents(events, "content")
+	require.Len(t, contentEvents, 1)
+	require.Equal(t, "Ready? ", contentEvents[0].Content)
+}
+
+func TestStreamContentBuffer_ExplicitFlush(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	cb := newStreamContentBuffer(&buf, "s-1")
+
+	require.NoError(t, cb.Write("partial content"))
+	require.Empty(t, buf.String())
+
+	require.NoError(t, cb.Flush())
+
+	events := parseNDJSON(t, buf.String())
+	contentEvents := filterEvents(events, "content")
+	require.Len(t, contentEvents, 1)
+	require.Equal(t, "partial content", contentEvents[0].Content)
+}
+
+func TestStreamContentBuffer_FlushEmpty(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	cb := newStreamContentBuffer(&buf, "s-1")
+
+	require.NoError(t, cb.Flush())
+	require.Empty(t, buf.String(), "flushing empty buffer should produce no output")
+}
+
+func TestStreamContentBuffer_Total(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	cb := newStreamContentBuffer(&buf, "s-1")
+
+	require.NoError(t, cb.Write("Hello. "))
+	require.NoError(t, cb.Write("World"))
+
+	require.Equal(t, "Hello. World", cb.Total())
+}
+
+func TestStreamContentBuffer_TotalAfterFlush(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	cb := newStreamContentBuffer(&buf, "s-1")
+
+	require.NoError(t, cb.Write("First. "))
+	require.NoError(t, cb.Write("Second"))
+	require.NoError(t, cb.Flush())
+
+	require.Equal(t, "First. Second", cb.Total())
+}
+
+func TestStreamContentBuffer_MultipleSentences(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	cb := newStreamContentBuffer(&buf, "s-1")
+
+	require.NoError(t, cb.Write("One. "))
+	require.NoError(t, cb.Write("Two. "))
+	require.NoError(t, cb.Write("Three"))
+	require.NoError(t, cb.Flush())
+
+	events := parseNDJSON(t, buf.String())
+	contentEvents := filterEvents(events, "content")
+	require.Len(t, contentEvents, 3)
+	require.Equal(t, "One. ", contentEvents[0].Content)
+	require.Equal(t, "Two. ", contentEvents[1].Content)
+	require.Equal(t, "Three", contentEvents[2].Content)
+}
+
+func TestStreamContentBuffer_TimerNilWhenEmpty(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	cb := newStreamContentBuffer(&buf, "s-1")
+
+	require.Nil(t, cb.Timer(), "timer should be nil when buffer is empty")
+}
+
+func TestStreamContentBuffer_TimerNonNilWithPending(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	cb := newStreamContentBuffer(&buf, "s-1")
+
+	require.NoError(t, cb.Write("pending"))
+	require.NotNil(t, cb.Timer(), "timer should be non-nil with pending content")
+}
+
+func TestStreamContentBuffer_WriteEmpty(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	cb := newStreamContentBuffer(&buf, "s-1")
+
+	require.NoError(t, cb.Write(""))
+	require.Empty(t, buf.String())
+	require.Equal(t, "", cb.Total())
 }
