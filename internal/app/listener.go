@@ -174,7 +174,7 @@ func (l *Listener) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	// Resolve or create session.
+	// Resolve session: explicit ID > TUI's active session > new session.
 	var sess session.Session
 	if req.SessionID != "" {
 		sess, err = l.app.Sessions.Get(connCtx, req.SessionID)
@@ -182,11 +182,22 @@ func (l *Listener) handleConn(ctx context.Context, conn net.Conn) {
 			writeSocketError(conn, fmt.Sprintf("session not found: %s", req.SessionID))
 			return
 		}
+	} else if activeID := l.app.ActiveSessionID.Get(); activeID != "" {
+		sess, err = l.app.Sessions.Get(connCtx, activeID)
+		if err != nil {
+			writeSocketError(conn, fmt.Sprintf("active session not found: %s", activeID))
+			return
+		}
 	} else {
 		sess, err = l.app.Sessions.Create(connCtx, "socket")
 		if err != nil {
 			writeSocketError(conn, fmt.Sprintf("failed to create session: %v", err))
 			return
+		}
+		// Ask the TUI to navigate to this session so the user sees it.
+		select {
+		case l.app.events <- SwitchSessionMsg{SessionID: sess.ID}:
+		default:
 		}
 	}
 
@@ -409,20 +420,20 @@ func readSocketRequest(conn net.Conn) (SocketRequest, error) {
 		return SocketRequest{}, fmt.Errorf("failed to set read deadline: %w", err)
 	}
 
+	// Use a JSON decoder so we consume exactly one JSON object without
+	// requiring the client to close the write side of the connection.
+	// The LimitReader guards against oversized payloads.
 	reader := io.LimitReader(conn, maxSocketRequestSize)
-	data, err := io.ReadAll(reader)
-	if err != nil {
-		return SocketRequest{}, fmt.Errorf("failed to read request: %w", err)
+	dec := json.NewDecoder(reader)
+
+	var req SocketRequest
+	if err := dec.Decode(&req); err != nil {
+		return SocketRequest{}, fmt.Errorf("invalid JSON: %w", err)
 	}
 
 	// Reset the deadline for writing.
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
 		return SocketRequest{}, fmt.Errorf("failed to reset read deadline: %w", err)
-	}
-
-	var req SocketRequest
-	if err := json.Unmarshal(data, &req); err != nil {
-		return SocketRequest{}, fmt.Errorf("invalid JSON: %w", err)
 	}
 
 	if strings.TrimSpace(req.Prompt) == "" {
@@ -441,10 +452,48 @@ func writeSocketError(w io.Writer, errMsg string) {
 }
 
 // DefaultSocketPath returns a default socket path for the current process.
+// Used by --listen auto to create a predictable socket location.
 func DefaultSocketPath() string {
+	dir := socketDir()
+	return filepath.Join(dir, fmt.Sprintf("%d.sock", os.Getpid()))
+}
+
+// DiscoverSocketPath finds the most recently modified .sock file in the
+// standard socket directory. Used by --socket auto to locate a running
+// Crush instance. Returns an empty string if no socket is found.
+func DiscoverSocketPath() string {
+	dir := socketDir()
+	pattern := filepath.Join(dir, "*.sock")
+	matches, err := filepath.Glob(pattern)
+	if err != nil || len(matches) == 0 {
+		return ""
+	}
+	// Pick the most recently modified socket.
+	var best string
+	var bestTime time.Time
+	for _, m := range matches {
+		info, err := os.Stat(m)
+		if err != nil {
+			continue
+		}
+		if best == "" || info.ModTime().After(bestTime) {
+			bestTime = info.ModTime()
+			best = m
+		}
+	}
+	return best
+}
+
+// SocketDir returns the standard directory description used for auto
+// socket path resolution, suitable for help text.
+func SocketDir() string {
+	return socketDir()
+}
+
+func socketDir() string {
 	dir := os.Getenv("XDG_RUNTIME_DIR")
 	if dir == "" {
 		dir = os.TempDir()
 	}
-	return filepath.Join(dir, "crush", fmt.Sprintf("%d.sock", os.Getpid()))
+	return filepath.Join(dir, "crush")
 }

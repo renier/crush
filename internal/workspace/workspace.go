@@ -141,6 +141,10 @@ type Workspace interface {
 	// Events
 	Subscribe(program *tea.Program)
 	Shutdown()
+
+	// ActiveSession tracking for socket listener.
+	SetActiveSessionID(id string)
+	GetActiveSessionID() string
 }
 
 // MCPResourceContents holds the contents of an MCP resource.

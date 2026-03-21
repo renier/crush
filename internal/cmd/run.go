@@ -33,7 +33,11 @@ var runCmd = &cobra.Command{
 	Use:     "run [prompt...]",
 	Short:   "Run a single non-interactive prompt",
 	Long: `Run a single prompt in non-interactive mode and exit.
-The prompt can be provided as arguments or piped from stdin.`,
+The prompt can be provided as arguments or piped from stdin.
+
+When --socket is used, the prompt is sent to a running Crush instance
+instead of starting a new one. Use 'auto' to discover a socket in
+$XDG_RUNTIME_DIR/crush/ (falls back to $TMPDIR/crush/).`,
 	Example: `
 # Run a simple prompt
 crush run "Guess my 5 favorite Pokémon"
@@ -59,6 +63,12 @@ crush run --session {session-id} "Follow up on your last response"
 # Continue the most recent session
 crush run --continue "Follow up on your last response"
 
+# Send a prompt to a running Crush TUI via socket
+crush run --socket ./session.sock "Fix the failing tests"
+
+# Auto-discover a running Crush instance
+crush run --socket auto "Fix the failing tests"
+
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		var (
@@ -70,6 +80,7 @@ crush run --continue "Follow up on your last response"
 			useLast, _      = cmd.Flags().GetBool("continue")
 			outputFormat, _ = cmd.Flags().GetString("output-format")
 			pretty, _       = cmd.Flags().GetBool("pretty")
+			socketPath, _   = cmd.Flags().GetString("socket")
 		)
 
 		format := app.OutputFormat(outputFormat)
@@ -77,22 +88,41 @@ crush run --continue "Follow up on your last response"
 			return fmt.Errorf("invalid output format %q; valid formats: text, json, stream-json", outputFormat)
 		}
 
-		// Cancel on SIGINT or SIGTERM.
-		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
-		defer cancel()
-
-
 		prompt := strings.Join(args, " ")
-
-		prompt, err := MaybePrependStdin(prompt)
+		var err error
+		prompt, err = MaybePrependStdin(prompt)
 		if err != nil {
 			slog.Error("Failed to read from stdin", "error", err)
 			return err
 		}
-
 		if prompt == "" {
 			return fmt.Errorf("no prompt provided")
 		}
+
+		// Socket client path: connect to a running Crush instance
+		// instead of starting a full app.
+		if socketPath != "" {
+			if socketPath == "auto" {
+				socketPath = app.DiscoverSocketPath()
+				if socketPath == "" {
+					return fmt.Errorf("no crush socket found in %s; start crush with --listen first", app.SocketDir())
+				}
+			}
+
+			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
+			defer cancel()
+
+			return app.RunViaSocket(ctx, os.Stdout, app.SocketClientOptions{
+				SocketPath: socketPath,
+				Prompt:     prompt,
+				Format:     format,
+				Pretty:     pretty,
+			})
+		}
+
+		// Cancel on SIGINT or SIGTERM.
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
+		defer cancel()
 
 		event.SetNonInteractive(true)
 
@@ -172,7 +202,10 @@ func init() {
 	runCmd.Flags().BoolP("continue", "C", false, "Continue the most recent session")
 	runCmd.Flags().StringP("output-format", "o", "text", "Output format: text, json, stream-json")
 	runCmd.Flags().Bool("pretty", false, "Pretty-print JSON output")
-	runCmd.MarkFlagsMutuallyExclusive("session", "continue")
+	runCmd.Flags().String("socket", "", "Send prompt to a running Crush instance via Unix socket (path or 'auto')")
+	runCmd.MarkFlagsMutuallyExclusive("session", "continue", "socket")
+	runCmd.MarkFlagsMutuallyExclusive("socket", "model")
+	runCmd.MarkFlagsMutuallyExclusive("socket", "small-model")
 }
 
 // runNonInteractive executes the agent via the server and streams output

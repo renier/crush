@@ -55,7 +55,7 @@ func init() {
 	rootCmd.Flags().BoolP("yolo", "y", false, "Automatically accept all permissions (dangerous mode)")
 	rootCmd.Flags().StringP("session", "s", "", "Continue a previous session by ID")
 	rootCmd.Flags().BoolP("continue", "C", false, "Continue the most recent session")
-	rootCmd.Flags().StringP("listen", "l", "", "Start a Unix socket listener for external prompts (path or 'auto')")
+	rootCmd.Flags().StringP("listen", "l", "", "Start a Unix socket listener for external prompts.\nPass a path or 'auto' to use $XDG_RUNTIME_DIR/crush/<pid>.sock\n(falls back to $TMPDIR/crush/<pid>.sock)")
 	rootCmd.MarkFlagsMutuallyExclusive("session", "continue")
 
 	rootCmd.AddCommand(

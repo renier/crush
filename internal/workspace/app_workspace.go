@@ -375,6 +375,16 @@ func (w *AppWorkspace) Shutdown() {
 	w.app.Shutdown()
 }
 
+// SetActiveSessionID records the currently active TUI session.
+func (w *AppWorkspace) SetActiveSessionID(id string) {
+	w.app.ActiveSessionID.Set(id)
+}
+
+// GetActiveSessionID returns the currently active TUI session ID.
+func (w *AppWorkspace) GetActiveSessionID() string {
+	return w.app.ActiveSessionID.Get()
+}
+
 // App returns the underlying app.App instance.
 func (w *AppWorkspace) App() *app.App {
 	return w.app

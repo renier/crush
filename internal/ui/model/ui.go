@@ -496,12 +496,15 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if cmd := m.handleAgentNotification(msg.Payload); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+	case app.SwitchSessionMsg:
+		cmds = append(cmds, m.loadSession(msg.SessionID))
 	case loadSessionMsg:
 		if m.forceCompactMode {
 			m.isCompact = true
 		}
 		m.setState(uiChat, m.focus)
 		m.session = msg.session
+		m.com.Workspace.SetActiveSessionID(msg.session.ID)
 		m.sessionFiles = msg.files
 		cmds = append(cmds, m.startLSPs(msg.lspFilePaths()))
 		msgs, err := m.com.Workspace.ListMessages(context.Background(), m.session.ID)
@@ -2997,6 +3000,7 @@ func (m *UI) sendMessage(content string, attachments ...message.Attachment) tea.
 		}
 		if newSession.ID != "" {
 			m.session = &newSession
+			m.com.Workspace.SetActiveSessionID(newSession.ID)
 			cmds = append(cmds, m.loadSession(newSession.ID))
 		}
 		m.setState(uiChat, m.focus)
@@ -3293,6 +3297,7 @@ func (m *UI) newSession() tea.Cmd {
 	}
 
 	m.session = nil
+	m.com.Workspace.SetActiveSessionID("")
 	m.sessionFiles = nil
 	m.sessionFileReads = nil
 	m.setState(uiLanding, uiFocusEditor)

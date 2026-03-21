@@ -22,6 +22,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/notify"
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/db"
 	"github.com/charmbracelet/crush/internal/event"
 	"github.com/charmbracelet/crush/internal/filetracker"
@@ -51,6 +52,13 @@ type UpdateAvailableMsg struct {
 	IsDevelopment  bool
 }
 
+// SwitchSessionMsg asks the TUI to navigate to a specific session.
+// Sent by the socket listener when it creates a new session while the
+// TUI has no active session.
+type SwitchSessionMsg struct {
+	SessionID string
+}
+
 type App struct {
 	Sessions    session.Service
 	Messages    message.Service
@@ -61,6 +69,11 @@ type App struct {
 	AgentCoordinator agent.Coordinator
 
 	LSPManager *lsp.Manager
+
+	// ActiveSessionID is the session currently displayed in the TUI.
+	// The socket listener reads this to route prompts to the active
+	// session when the client does not specify one.
+	ActiveSessionID csync.Value[string]
 
 	config *config.ConfigStore
 

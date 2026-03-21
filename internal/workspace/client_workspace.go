@@ -563,6 +563,13 @@ func (w *ClientWorkspace) Shutdown() {
 	_ = w.client.DeleteWorkspace(context.Background(), w.workspaceID())
 }
 
+// SetActiveSessionID is a no-op for the client workspace. The socket
+// listener only operates in local (AppWorkspace) mode.
+func (w *ClientWorkspace) SetActiveSessionID(_ string) {}
+
+// GetActiveSessionID always returns empty for client workspaces.
+func (w *ClientWorkspace) GetActiveSessionID() string { return "" }
+
 // translateEvent converts proto-typed SSE events into the domain types
 // that the TUI's Update() method expects.
 func translateEvent(ev any) tea.Msg {
