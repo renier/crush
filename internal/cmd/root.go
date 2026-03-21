@@ -55,6 +55,7 @@ func init() {
 	rootCmd.Flags().BoolP("yolo", "y", false, "Automatically accept all permissions (dangerous mode)")
 	rootCmd.Flags().StringP("session", "s", "", "Continue a previous session by ID")
 	rootCmd.Flags().BoolP("continue", "C", false, "Continue the most recent session")
+	rootCmd.Flags().StringP("listen", "l", "", "Start a Unix socket listener for external prompts (path or 'auto')")
 	rootCmd.MarkFlagsMutuallyExclusive("session", "continue")
 
 	rootCmd.AddCommand(
@@ -107,7 +108,39 @@ crush --continue
 		if err != nil {
 			return err
 		}
-		defer cleanup()
+
+		// Start socket listener if requested. The listener
+		// operates on the in-process App, so it is only available
+		// in local (non-client/server) mode.
+		var listener *app.Listener
+		listenPath, _ := cmd.Flags().GetString("listen")
+		if listenPath == "auto" {
+			listenPath = app.DefaultSocketPath()
+		}
+		if listenPath != "" {
+			if appWs, ok := ws.(*workspace.AppWorkspace); ok {
+				appWs.App().Permissions.SetSkipRequests(true)
+				listener = app.NewListener(appWs.App(), listenPath)
+				go func() {
+					if err := listener.Listen(cmd.Context()); err != nil {
+						slog.Error("Socket listener error", "error", err)
+					}
+				}()
+			} else {
+				slog.Warn("Socket listener is not supported in client/server mode")
+			}
+		}
+
+		// Cleanup must run before listener.Close so that CancelAll
+		// terminates in-flight agent goroutines, unblocking any
+		// active socket connections before the listener waits for
+		// them to drain.
+		defer func() {
+			cleanup()
+			if listener != nil {
+				listener.Close()
+			}
+		}()
 
 		if sessionID != "" {
 			sess, err := resolveWorkspaceSessionID(cmd.Context(), ws, sessionID)
