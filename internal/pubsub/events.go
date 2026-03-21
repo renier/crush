@@ -37,6 +37,13 @@ type Subscriber[T any] interface {
 	Subscribe(context.Context) <-chan Event[T]
 }
 
+// BlockingSubscriber extends Subscriber with a blocking variant that
+// guarantees no events are dropped. Publish blocks until the subscriber
+// consumes the event.
+type BlockingSubscriber[T any] interface {
+	SubscribeBlocking(context.Context) <-chan Event[T]
+}
+
 type (
 	// EventType identifies the type of event.
 	EventType string

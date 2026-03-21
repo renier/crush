@@ -320,8 +320,21 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, opts No
 		}
 	}(ctx, sess.ID, opts.Prompt)
 
-	messageEvents := app.Messages.Subscribe(ctx)
-	sessionEvents := app.Sessions.Subscribe(ctx)
+	// Use blocking subscriptions for the non-interactive path so
+	// that no events are silently dropped when the consumer is
+	// momentarily slow.
+	var messageEvents <-chan pubsub.Event[message.Message]
+	if bs, ok := app.Messages.(pubsub.BlockingSubscriber[message.Message]); ok {
+		messageEvents = bs.SubscribeBlocking(ctx)
+	} else {
+		messageEvents = app.Messages.Subscribe(ctx)
+	}
+	var sessionEvents <-chan pubsub.Event[session.Session]
+	if bs, ok := app.Sessions.(pubsub.BlockingSubscriber[session.Session]); ok {
+		sessionEvents = bs.SubscribeBlocking(ctx)
+	} else {
+		sessionEvents = app.Sessions.Subscribe(ctx)
+	}
 	childSessions := make(map[string]bool)
 	messageReadBytes := make(map[string]int)
 	var (
@@ -368,6 +381,67 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, opts No
 		}
 	}()
 
+	// processMessage handles a single message event, writing content
+	// to the appropriate output and emitting stream-json events.
+	processMessage := func(msg message.Message) error {
+		if len(msg.Parts) == 0 {
+			return nil
+		}
+
+		isChildSession := childSessions[msg.SessionID]
+		if msg.SessionID != sess.ID && !isChildSession {
+			return nil
+		}
+
+		if msg.Role == message.Assistant && !isChildSession {
+			stopSpinner()
+
+			content := msg.Content().String()
+			readBytes := messageReadBytes[msg.ID]
+
+			if len(content) < readBytes {
+				slog.Error("Non-interactive: message content is shorter than read bytes", "message_length", len(content), "read_bytes", readBytes)
+				return fmt.Errorf("message content is shorter than read bytes: %d < %d", len(content), readBytes)
+			}
+
+			part := content[readBytes:]
+			if readBytes == 0 {
+				part = strings.TrimLeft(part, " \t")
+			}
+			if printed || strings.TrimSpace(part) != "" {
+				printed = true
+
+				switch opts.Format {
+				case OutputFormatText:
+					fmt.Fprint(output, part)
+				case OutputFormatJSON:
+					contentBuilder.WriteString(part)
+				case OutputFormatStreamJSON:
+					if part != "" {
+						if err := contentBuf.Write(part); err != nil {
+							return fmt.Errorf("failed to buffer stream content: %w", err)
+						}
+					}
+				}
+			}
+			messageReadBytes[msg.ID] = len(content)
+		}
+
+		if opts.Format != OutputFormatStreamJSON {
+			return nil
+		}
+
+		if err := contentBuf.Flush(); err != nil {
+			return fmt.Errorf("failed to flush content buffer: %w", err)
+		}
+
+		if err := emitStreamEvents(output, msg.SessionID, &msg, getState(msg.ID)); err != nil {
+			return fmt.Errorf("failed to write stream event: %w", err)
+		}
+
+		return nil
+	}
+
 	for {
 		if progress && stderrTTY && opts.Format == OutputFormatText {
 			_, _ = fmt.Fprintf(os.Stderr, ansi.SetIndeterminateProgressBar)
@@ -382,6 +456,30 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, opts No
 		select {
 		case result := <-done:
 			stopSpinner()
+
+			// Drain any message and session events that are
+			// already buffered so we don't miss final updates
+			// (e.g. message_finish) that were published just
+			// before the agent returned.
+			drainDeadline := time.After(500 * time.Millisecond)
+		drain:
+			for {
+				select {
+				case sev := <-sessionEvents:
+					if sev.Payload.ParentSessionID == sess.ID {
+						childSessions[sev.Payload.ID] = true
+					}
+				case ev := <-messageEvents:
+					if err := processMessage(ev.Payload); err != nil {
+						slog.Error("Failed to process message during drain", "error", err)
+					}
+				case <-drainDeadline:
+					break drain
+				default:
+					break drain
+				}
+			}
+
 			if contentBuf != nil {
 				if err := contentBuf.Flush(); err != nil {
 					slog.Error("Failed to flush content buffer on completion", "error", err)
@@ -409,69 +507,8 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, opts No
 			}
 
 		case ev := <-messageEvents:
-			msg := ev.Payload
-			if len(msg.Parts) == 0 {
-				continue
-			}
-
-			isChildSession := childSessions[msg.SessionID]
-			if msg.SessionID != sess.ID && !isChildSession {
-				continue
-			}
-
-			// For text and json formats, only process assistant text
-			// content from the parent session. Child session output
-			// arrives as a tool_result on the parent and should not
-			// be mixed in directly.
-			if msg.Role == message.Assistant && !isChildSession {
-				stopSpinner()
-
-				content := msg.Content().String()
-				readBytes := messageReadBytes[msg.ID]
-
-				if len(content) < readBytes {
-					slog.Error("Non-interactive: message content is shorter than read bytes", "message_length", len(content), "read_bytes", readBytes)
-					return fmt.Errorf("message content is shorter than read bytes: %d < %d", len(content), readBytes)
-				}
-
-				part := content[readBytes:]
-				if readBytes == 0 {
-					part = strings.TrimLeft(part, " \t")
-				}
-				if printed || strings.TrimSpace(part) != "" {
-					printed = true
-
-					switch opts.Format {
-					case OutputFormatText:
-						fmt.Fprint(output, part)
-					case OutputFormatJSON:
-						contentBuilder.WriteString(part)
-					case OutputFormatStreamJSON:
-						if part != "" {
-							if err := contentBuf.Write(part); err != nil {
-								return fmt.Errorf("failed to buffer stream content: %w", err)
-							}
-						}
-					}
-				}
-				messageReadBytes[msg.ID] = len(content)
-			}
-
-			// Emit additional stream-json events for all message
-			// parts the text-only path above does not cover.
-			if opts.Format != OutputFormatStreamJSON {
-				continue
-			}
-
-			// Flush any buffered content before structural events
-			// so that text always appears before tool_call,
-			// message_finish, etc. in the output stream.
-			if err := contentBuf.Flush(); err != nil {
-				return fmt.Errorf("failed to flush content buffer: %w", err)
-			}
-
-			if err := emitStreamEvents(output, msg.SessionID, &msg, getState(msg.ID)); err != nil {
-				return fmt.Errorf("failed to write stream event: %w", err)
+			if err := processMessage(ev.Payload); err != nil {
+				return err
 			}
 
 		case <-ctx.Done():
