@@ -54,6 +54,8 @@ func (m *mockMessageService) ListAllUserMessages(context.Context) ([]message.Mes
 }
 func (m *mockMessageService) Delete(context.Context, string) error                { return nil }
 func (m *mockMessageService) DeleteSessionMessages(context.Context, string) error { return nil }
+func (m *mockMessageService) Flush(context.Context, string) error                 { return nil }
+func (m *mockMessageService) FlushAll(context.Context) error                      { return nil }
 
 // mockSessionServiceWithBroker extends mockSessionService with a real broker
 // so that session creation events are delivered to subscribers.
