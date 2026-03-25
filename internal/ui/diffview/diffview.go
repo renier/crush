@@ -252,6 +252,9 @@ func (dv *DiffView) replaceTabs() {
 }
 
 // computeDiff computes the differences between the "before" and "after" files.
+// It uses line-level diffing to produce results consistent with git diff. Using
+// character-level diffing (udiff.Strings) causes unchanged lines to appear as
+// changed when edits span line boundaries.
 func (dv *DiffView) computeDiff() error {
 	if dv.isComputed {
 		return dv.err
